@@ -1,7 +1,9 @@
 import express from 'express';
 import healthRoutes from './health.js';
-import angelOneRoutes from './angelOne.js';
 import authRoutes from './auth.js';
+import angelOneRoutes from './angelOne.js';
+import orderRoutes from './orders.js';
+import scriptRoutes from './scripts.js';
 
 const router = express.Router();
 
@@ -13,6 +15,12 @@ router.use('/auth', authRoutes);
 
 // Angel One routes
 router.use('/angelone', angelOneRoutes);
+
+// Order routes
+router.use('/orders', orderRoutes);
+
+// Script routes
+router.use('/scripts', scriptRoutes);
 
 // Catch-all route
 router.all('*', (req, res) => {

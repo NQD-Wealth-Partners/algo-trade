@@ -234,8 +234,7 @@ export async function getAngelOneTokens(userId, forceRefresh = false) {
       feed_token: sessionData.data.feedToken,
       client_code: sessionData.data.clientcode,
       login_time: new Date().toISOString(),
-      expires_in: sessionData.data.tokenExpiryTime,
-      sessionData // Include the SmartAPI instance for convenience
+      expires_in: sessionData.data.tokenExpiryTime
     };
     
     // Cache tokens - set expiry to 90% of token lifetime to ensure we refresh before expiry
@@ -263,9 +262,9 @@ export async function getAngelOneProfile(userId) {
   try {
     const tokenData = await getAngelOneTokens(userId);
     const smartApi = new SmartAPI({
-      api_key: tokenData.smartApi.api_key,
-      access_token: tokenData.smartApi.access_token,
-      refresh_token: tokenData.smartApi.refresh_token
+      api_key: config.angelOne.apiKey,
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token
 
     });
     return await smartApi.getProfile();

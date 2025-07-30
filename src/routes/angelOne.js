@@ -18,7 +18,7 @@ router.get('/status', angelOneController.getLinkStatus);
 // Get authentication token
 router.get('/token', angelOneController.getAuthToken);
 
-// Get user profile (with cache)
+// Get user profile
 router.get('/profile', angelOneController.getProfile);
 
 // Refresh tokens
