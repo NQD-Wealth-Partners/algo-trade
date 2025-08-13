@@ -13,16 +13,16 @@ router.route('/')
   .post(orderController.placeOrder)
   .get(orderController.getOrderBook);
 
+// Positions
+router.get('/positions', orderController.getPositions);
+router.post('/positions/convert', orderController.convertPosition);
+
 router.route('/:orderId')
   .get(orderController.getOrderDetails)
   .put(orderController.modifyOrder)
   .delete(orderController.cancelOrder);
 
-// Positions
-router.get('/positions', orderController.getPositions);
-router.post('/positions/convert', orderController.convertPosition);
-
-// Holdings
+  // Holdings
 router.get('/holdings', orderController.getHoldings);
 
 // GTT orders

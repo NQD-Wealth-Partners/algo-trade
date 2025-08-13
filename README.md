@@ -22,7 +22,3 @@
 ```docker volume create n8n_data```
 
 ```docker run -d --network algoTrade --name algo-trade-n8n -p 5678:5678 -v n8n_data:/data docker.n8n.io/n8nio/n8n```
-
-
-
-

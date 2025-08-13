@@ -9,6 +9,7 @@ import routes from './src/routes/index.js';
 import { errorHandler } from './src/middleware/errorHandler.js';
 import logger from './src/utils/logger.js';
 import { connectRedis } from './src/config/redis.js';
+import * as websocketService from './src/services/websocketService.js';
 
 // Initialize Express app
 const app = express();
@@ -33,6 +34,15 @@ app.use(errorHandler);
 // Start server
 const server = app.listen(config.port, () => {
   logger.info(`Server running on port ${config.port} in ${config.nodeEnv} mode`);
+
+    // Initialize WebSocket service
+  websocketService.initializeWebSocket()
+    .then(() => {
+      logger.info('WebSocket service initialized successfully');
+    })
+    .catch(error => {
+      logger.error('Failed to initialize WebSocket service:', error);
+    });
 });
 
 // Handle unhandled promise rejections

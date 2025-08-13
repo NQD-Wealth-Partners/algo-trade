@@ -17,7 +17,14 @@ const config = {
   },
   // Add Angel One configuration
   angelOne: {
-    apiKey: process.env.ANGEL_ONE_API_KEY
+    apiKey: process.env.ANGEL_ONE_API_KEY,
+    wsUrl: process.env.ANGEL_ONE_WS_URL || 'wss://smartapisocket.angelone.in/smart-stream'
+  },
+    // Add Angel One creds for websocket
+  angelOneWebSocket: {
+    clientId: process.env.ANGEL_ONE_CLIENT_ID,
+    password: process.env.ANGEL_ONE_PASSWORD,
+    totp: process.env.ANGEL_ONE_TOTP
   },
   jwt: {
     secret: process.env.JWT_SECRET || 'your-default-secret-key-for-development',
