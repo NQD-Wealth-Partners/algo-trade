@@ -15,8 +15,8 @@ export const createOrderPlan = asyncHandler(async (req, res) => {
     // Validate required parameters
     const requiredParams = [
       'variety', 'tradingsymbol', 'symboltoken', 'transactiontype', 
-      'exchange', 'ordertype', 'producttype', 'duration', 
-      'price', 'quantity', 'lotsize', 'entry_price', 'exit_price'
+      'exchange', 'ordertype', 'producttype', 'duration',
+      'quantity', 'lotsize', 'exit_tick_size'
     ];
     
     for (const param of requiredParams) {

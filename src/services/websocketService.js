@@ -2,20 +2,25 @@ import WebSocket from 'ws';
 import logger from '../utils/logger.js';
 import config from '../config/index.js';
 import * as orderPlanRedisService from './orderPlanRedisService.js';
-import {generateTOTP } from './angelOneService.js';
+import {generateTOTP} from './angelOneService.js';
 import Redis from 'ioredis';
-import axios from 'axios';
-import { SmartAPI } from 'smartapi-javascript';
+import {SmartAPI} from 'smartapi-javascript';
 
-// Initialize Redis client for pub/sub
-const redisPubSub = new Redis({
+// Initialize Redis clients - separate connections for different purposes
+const redisSubscriber = new Redis({
   host: config.redis?.host || 'algo-trade-redis',
   port: config.redis?.port || 6379,
   password: config.redis?.password || '',
   db: config.redis?.db || 0
 });
 
-// Initialize Redis client for data storage
+const redisPublisher = new Redis({
+  host: config.redis?.host || 'algo-trade-redis',
+  port: config.redis?.port || 6379,
+  password: config.redis?.password || '',
+  db: config.redis?.db || 0
+});
+
 const redisClient = new Redis({
   host: config.redis?.host || 'algo-trade-redis',
   port: config.redis?.port || 6379,
@@ -28,46 +33,6 @@ const smartApi = new SmartAPI({
   api_key: config.angelOne.apiKey,
 });
 
-// WebSocket connection
-let ws = null;
-
-// Subscription tracker
-const subscriptions = new Map(); // Map<token, Set<planId>>
-const tokenToSymbolMap = new Map(); // Map<token, symbol>
-const symbolToTokenMap = new Map(); // Map<symbol, token>
-
-// Last ticks
-const lastTicks = new Map(); // Map<token, tickData>
-
-// Message handling variables
-let binaryMessageBuffer = null;
-let expectedMessageLength = null;
-let messageAssemblyTimeout = null;
-const MESSAGE_ASSEMBLY_TIMEOUT = 5000; // 5 seconds
-
-// Connection tracking variables
-let lastMessageTime = Date.now();
-let lastPongTime = Date.now();
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 10;
-const RECONNECT_DELAY = 5000; // 5 seconds base delay
-
-// Intervals
-let pingInterval = null;
-let marketDataRequestInterval = null;
-let connectionHealthCheckInterval = null;
-
-
-// Authentication session
-let currentSession = null;
-
-
-const pendingSubscriptions = new Map(); // token -> { exchange, planId }
-
-// Cached order plans
-const cachedPlans = new Map(); // plan ID -> plan object
-
-
 // WebSocket connection states
 const ConnectionState = {
   DISCONNECTED: 'disconnected',
@@ -78,20 +43,89 @@ const ConnectionState = {
   RECONNECTING: 'reconnecting'
 };
 
-// Current connection state
-let connectionState = ConnectionState.DISCONNECTED;
+// Constants
+const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_DELAY = 5000;
+const MESSAGE_ASSEMBLY_TIMEOUT = 5000;
 
+// Connection state variables
+let ws = null;
+let connectionState = ConnectionState.DISCONNECTED;
+let currentSession = null;
+let lastMessageTime = Date.now();
+let lastPongTime = Date.now();
+let reconnectAttempts = 0;
+
+// Message handling variables
+let binaryMessageBuffer = null;
+let expectedMessageLength = null;
+let messageAssemblyTimeout = null;
+
+// Intervals
+let pingInterval = null;
+let marketDataRequestInterval = null;
+let connectionHealthCheckInterval = null;
+let bufferCleanupInterval = null;
+
+// Subscription tracking
+const subscriptions = new Map(); // Map<token, Set<planId>>
+const pendingSubscriptions = new Map(); // token -> { exchange, planId, symbol }
+const tokenToSymbolMap = new Map(); // Map<token, symbol>
+const symbolToTokenMap = new Map(); // Map<symbol, token>
+const lastTicks = new Map(); // Map<token, tickData>
+
+const priceMode = 3;
+
+// WebSocket connection states and initialization
+let wsLTP = null; // For Mode 1 (LTP)
+let wsMarketDepth = null; // For Mode 3 (Snap Quote with Best Five)
+let ltpConnectionState = ConnectionState.DISCONNECTED;
+let depthConnectionState = ConnectionState.DISCONNECTED;
+
+// Variables for intervals
+let ltpPingInterval = null;
+let ltpMarketDataRequestInterval = null;
+let ltpConnectionHealthCheckInterval = null;
+let ltpBufferCleanupInterval = null;
+
+let depthPingInterval = null;
+let depthMarketDataRequestInterval = null;
+let depthConnectionHealthCheckInterval = null;
+let depthBufferCleanupInterval = null;
+
+// Connection monitoring variables for LTP WebSocket
+let ltpLastMessageTime = Date.now();
+let ltpLastPongTime = Date.now();
+let ltpReconnectAttempts = 0;
+
+// Connection monitoring variables for Market Depth WebSocket
+let depthLastMessageTime = Date.now();
+let depthLastPongTime = Date.now();
+let depthReconnectAttempts = 0;
+
+// Message handling variables for LTP WebSocket
+let ltpBinaryMessageBuffer = null;
+let ltpExpectedMessageLength = null;
+let ltpMessageAssemblyTimeout = null;
+
+// Message handling variables for Market Depth WebSocket
+let depthBinaryMessageBuffer = null;
+let depthExpectedMessageLength = null;
+let depthMessageAssemblyTimeout = null;
 
 /**
- * Initialize WebSocket connection and subscriptions
+ * Initialize WebSocket connections and subscriptions
  */
-export async function initializeWebSocket() {
+export async function initializeWebSockets() {
   try {
     // Authenticate with Angel Broking
     const session = await authenticate();
     
-    // Connect to WebSocket
-    connectWebSocket(session);
+    // Connect both WebSockets
+    await Promise.all([
+      connectLTPWebSocket(session),
+      connectMarketDepthWebSocket(session)
+    ]);
     
     // Set up subscription refresh interval
     setInterval(refreshSubscriptions, 60 * 60 * 1000); // Every hour
@@ -99,11 +133,1400 @@ export async function initializeWebSocket() {
     // Initial subscription setup
     await setupInitialSubscriptions();
     
-    // Listen for new order plans
-    redisPubSub.subscribe('orderplan:new');
-    redisPubSub.subscribe('orderplan:delete');
+    // Listen for new order plans using the subscriber connection
+    redisSubscriber.subscribe('orderplan:new');
+    redisSubscriber.subscribe('orderplan:delete');
     
-    redisPubSub.on('message', async (channel, message) => {
+    redisSubscriber.on('message', async (channel, message) => {
+      if (channel === 'orderplan:new') {
+        const planId = message;
+        await subscribeToOrderPlan(planId);
+      } else if (channel === 'orderplan:delete') {
+        const planId = message;
+        await unsubscribeFromOrderPlan(planId);
+      }
+    });
+    
+    logger.info('WebSocket services initialized');
+  } catch (error) {
+    logger.error('Failed to initialize WebSocket services:', error);
+    throw error;
+  }
+}
+
+/**
+ * Connect LTP WebSocket (Mode 1)
+ * @param {Object} session - Authentication session with jwtToken and feedToken
+ * @returns {Promise<void>}
+ */
+function connectLTPWebSocket(session) {
+  return new Promise((resolve, reject) => {
+    try {
+      // Validate session
+      if (!session || !session.jwtToken) {
+        throw new Error('Invalid session: missing JWT token');
+      }
+      
+      // Close existing connection if any
+      closeLTPConnection();
+      
+      // Update connection state
+      ltpConnectionState = ConnectionState.CONNECTING;
+      logger.info('LTP WebSocket connection state:', ltpConnectionState);
+      
+      // Create new WebSocket connection
+      const wsUrl = config.angelOne.wsUrl || 'wss://smartapisocket.angelone.in/smart-stream';
+      logger.info(`Connecting to LTP WebSocket at ${wsUrl}`);
+      
+      // Create headers
+      const headers = {
+        'Authorization': `Bearer ${session.jwtToken}`,
+        'x-api-key': config.angelOne.apiKey,
+        'x-client-code': config.angelOneWebSocket.clientId,
+        'x-feed-token': session.feedToken || session.jwtToken
+      };
+      
+      wsLTP = new WebSocket(wsUrl, { headers });
+      
+      // Set binary type
+      wsLTP.binaryType = 'arraybuffer';
+      
+      // Set connection timeout
+      const connectionTimeout = setTimeout(() => {
+        if (ltpConnectionState !== ConnectionState.READY) {
+          logger.error('LTP WebSocket connection timeout after 30 seconds');
+          ltpConnectionState = ConnectionState.DISCONNECTED;
+          
+          if (wsLTP) {
+            try {
+              wsLTP.terminate();
+            } catch (err) {
+              logger.warn(`Error terminating LTP WebSocket: ${err.message}`);
+            }
+            wsLTP = null;
+          }
+          
+          reject(new Error('LTP WebSocket connection timeout'));
+        }
+      }, 30000);
+      
+      // Set up event handlers
+      setupLTPEventHandlers(resolve, reject, connectionTimeout, session);
+      
+    } catch (error) {
+      logger.error('Error connecting to LTP WebSocket:', error);
+      
+      // Update state
+      ltpConnectionState = ConnectionState.DISCONNECTED;
+      logger.info('LTP WebSocket connection state:', ltpConnectionState);
+      
+      reject(error);
+    }
+  });
+}
+
+/**
+ * Set up LTP WebSocket event handlers
+ * @param {Function} resolve - Promise resolve function
+ * @param {Function} reject - Promise reject function
+ * @param {Timeout} connectionTimeout - Connection timeout
+ * @param {Object} session - Session information
+ */
+function setupLTPEventHandlers(resolve, reject, connectionTimeout, session) {
+  wsLTP.on('open', () => {
+    logger.info('LTP WebSocket connection established');
+    
+    // Set up intervals
+    setupLTPIntervals();
+    
+    // Send authentication message
+    sendLTPAuthenticationMessage(session);
+  });
+  
+  wsLTP.on('message', (data) => {
+    try {
+      handleLTPWebSocketMessage(data);
+    } catch (err) {
+      logger.error(`Error in LTP message handler: ${err.message}`);
+      if (err.stack) logger.debug(`Stack trace: ${err.stack}`);
+    }
+  });
+  
+  wsLTP.on('error', (error) => {
+    logger.error('LTP WebSocket error:', error);
+    
+    // Clear connection timeout
+    clearTimeout(connectionTimeout);
+    
+    // Update state
+    ltpConnectionState = ConnectionState.DISCONNECTED;
+    logger.info('LTP WebSocket connection state:', ltpConnectionState);
+    
+    // Reject the promise if we're still connecting
+    reject(error);
+  });
+  
+  wsLTP.on('close', (code, reason) => {
+    logger.warn(`LTP WebSocket connection closed: ${code} ${reason}`);
+    
+    // Clear connection timeout
+    clearTimeout(connectionTimeout);
+    
+    // Update state
+    ltpConnectionState = ConnectionState.DISCONNECTED;
+    logger.info('LTP WebSocket connection state:', ltpConnectionState);
+    
+    // Clear intervals
+    clearLTPIntervals();
+    
+    // Handle reconnect
+    handleLTPReconnect();
+  });
+  
+  // Set up a special handler to update connection state to READY after authentication
+  setTimeout(() => {
+    if (ltpConnectionState === ConnectionState.AUTHENTICATED || ltpConnectionState === ConnectionState.CONNECTING) {
+      logger.info('Setting LTP connection state to READY after timeout');
+      ltpConnectionState = ConnectionState.READY;
+      
+      // Process subscriptions for LTP
+      try {
+        processLTPSubscriptions();
+      } catch (err) {
+        logger.error(`Error processing LTP subscriptions: ${err.message}`);
+      }
+      
+      // Resolve the promise
+      resolve();
+    }
+  }, 5000); // 5 second timeout
+}
+
+/**
+ * Set up maintenance intervals for LTP WebSocket
+ */
+function setupLTPIntervals() {
+  try {
+    // Update time trackers
+    ltpLastMessageTime = Date.now();
+    ltpLastPongTime = Date.now();
+    
+    // Set up ping interval
+    ltpPingInterval = setInterval(() => {
+      if (wsLTP && wsLTP.readyState === WebSocket.OPEN) {
+        try {
+          logger.debug('Sending ping to keep LTP WebSocket alive');
+          wsLTP.ping();
+        } catch (err) {
+          logger.warn(`Error sending ping to LTP WebSocket: ${err.message}`);
+        }
+      }
+    }, 30000); // Every 30 seconds
+    
+    // Set up market data request interval
+    ltpMarketDataRequestInterval = setInterval(() => {
+      if (ltpConnectionState === ConnectionState.READY && wsLTP && wsLTP.readyState === WebSocket.OPEN) {
+        try {
+          requestLTPMarketData();
+        } catch (err) {
+          logger.warn(`Error requesting LTP market data: ${err.message}`);
+        }
+      }
+    }, 60000); // Every 60 seconds
+    
+    // Set up connection health check
+    ltpConnectionHealthCheckInterval = setInterval(() => {
+      try {
+        checkLTPConnectionHealth();
+      } catch (err) {
+        logger.warn(`Error checking LTP connection health: ${err.message}`);
+      }
+    }, 60000); // Every 60 seconds
+    
+    // Set up buffer cleanup interval
+    ltpBufferCleanupInterval = setInterval(() => {
+      try {
+        cleanupLTPMessageBuffers();
+      } catch (err) {
+        logger.warn(`Error cleaning up LTP message buffers: ${err.message}`);
+      }
+    }, 10000); // Every 10 seconds
+    
+    logger.info('LTP WebSocket intervals set up');
+  } catch (error) {
+    logger.error(`Error setting up LTP intervals: ${error.message}`);
+  }
+}
+
+/**
+ * Clean up LTP message buffers
+ */
+function cleanupLTPMessageBuffers() {
+  try {
+    if (ltpBinaryMessageBuffer && ltpExpectedMessageLength) {
+      const now = Date.now();
+      const bufferAge = now - ltpLastMessageTime;
+      
+      // If buffer is older than 30 seconds, clean it up
+      if (bufferAge > 30000) {
+        logger.warn(`Cleaning up stale LTP message buffer (age: ${bufferAge}ms)`);
+        
+        // Reset buffer state
+        ltpBinaryMessageBuffer = null;
+        ltpExpectedMessageLength = null;
+        
+        // Clear timeout
+        if (ltpMessageAssemblyTimeout) {
+          clearTimeout(ltpMessageAssemblyTimeout);
+          ltpMessageAssemblyTimeout = null;
+        }
+      }
+    }
+  } catch (error) {
+    logger.error(`Error cleaning up LTP message buffers: ${error.message}`);
+  }
+}
+
+/**
+ * Check LTP connection health
+ */
+function checkLTPConnectionHealth() {
+  try {
+    if (!wsLTP) {
+      logger.warn('No LTP WebSocket connection to check');
+      return;
+    }
+    
+    const now = Date.now();
+    const timeSinceLastMessage = now - ltpLastMessageTime;
+    const timeSinceLastPong = now - ltpLastPongTime;
+    
+    logger.debug(`LTP connection health: Last message ${timeSinceLastMessage}ms ago, last pong ${timeSinceLastPong}ms ago`);
+    
+    // If no message for 5 minutes, reconnect
+    if (timeSinceLastMessage > 5 * 60 * 1000) {
+      logger.warn(`No LTP messages received for ${Math.floor(timeSinceLastMessage/1000)}s, reconnecting...`);
+      reconnectLTPWebSocket();
+    }
+    
+    // If no pong for 2 minutes, reconnect
+    if (timeSinceLastPong > 2 * 60 * 1000) {
+      logger.warn(`No LTP pong received for ${Math.floor(timeSinceLastPong/1000)}s, reconnecting...`);
+      reconnectLTPWebSocket();
+    }
+  } catch (error) {
+    logger.error(`Error checking LTP connection health: ${error.message}`);
+  }
+}
+
+/**
+ * Reconnect LTP WebSocket
+ */
+function reconnectLTPWebSocket() {
+  try {
+    logger.info('Initiating LTP WebSocket reconnection');
+    
+    // Close existing connection
+    closeLTPConnection();
+    
+    // Update state
+    ltpConnectionState = ConnectionState.RECONNECTING;
+    logger.info('LTP WebSocket connection state:', ltpConnectionState);
+    
+    // Re-authenticate
+    authenticate()
+      .then(newSession => connectLTPWebSocket(newSession))
+      .then(() => {
+        logger.info('LTP WebSocket reconnection successful');
+        
+        // Resubscribe to tokens
+        processLTPSubscriptions();
+      })
+      .catch(error => {
+        logger.error('LTP WebSocket reconnection failed:', error);
+        
+        // Schedule another reconnect attempt if within limits
+        if (ltpReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          handleLTPReconnect();
+        } else {
+          logger.error('Maximum LTP reconnection attempts reached. Giving up.');
+        }
+      });
+  } catch (error) {
+    logger.error('Error in reconnectLTPWebSocket:', error);
+  }
+}
+
+/**
+ * Request LTP market data for all subscribed tokens
+ */
+function requestLTPMarketData() {
+  try {
+    if (ltpConnectionState !== ConnectionState.READY || !wsLTP || wsLTP.readyState !== WebSocket.OPEN) {
+      logger.warn(`Cannot request LTP market data: WebSocket not ready (state: ${ltpConnectionState})`);
+      return;
+    }
+    
+    // Group tokens by exchange
+    const tokensByExchange = new Map(); // exchangeType -> array of tokens
+    
+    // Process all subscriptions
+    for (const [token, planIds] of subscriptions.entries()) {
+      if (planIds.size === 0) continue;
+      
+      // Get symbol for the token
+      const symbol = tokenToSymbolMap.get(token);
+      if (!symbol) {
+        logger.warn(`Cannot find symbol for token ${token}`);
+        continue;
+      }
+      
+      // Get exchange type for this symbol
+      const plan = findOrderPlanBySymbolSync(symbol);
+      if (!plan) {
+        logger.warn(`Cannot find order plan for symbol ${symbol}`);
+        continue;
+      }
+      
+      const exchangeType = mapExchangeToType(plan.exchange);
+      
+      // Add to tokens by exchange map
+      if (!tokensByExchange.has(exchangeType)) {
+        tokensByExchange.set(exchangeType, []);
+      }
+      
+      tokensByExchange.get(exchangeType).push(parseInt(token, 10));
+    }
+    
+    // If no tokens to request, return
+    if (tokensByExchange.size === 0) {
+      logger.debug('No tokens to request LTP market data for');
+      return;
+    }
+    
+    // Build token list for request
+    const tokenList = [];
+    for (const [exchangeType, tokens] of tokensByExchange.entries()) {
+      tokenList.push({
+        exchangeType,
+        tokens
+      });
+    }
+    
+    // Create request message
+    const requestMessage = {
+      correlationID: "ltp_marketdata_" + Date.now(),
+      action: 2, // MARKET_DATA_REQUEST
+      params: {
+        mode: 1, // LTP mode
+        tokenList
+      }
+    };
+    
+    // Log request summary
+    const tokenCount = tokenList.reduce((sum, item) => sum + item.tokens.length, 0);
+    logger.info(`Requesting LTP market data for ${tokenCount} tokens across ${tokenList.length} exchanges`);
+    
+    // Send request
+    wsLTP.send(JSON.stringify(requestMessage));
+  } catch (error) {
+    logger.error('Error requesting LTP market data:', error);
+  }
+}
+
+
+/**
+ * Process subscriptions for LTP WebSocket
+ */
+function processLTPSubscriptions() {
+  try {
+    logger.info('Processing LTP subscriptions');
+    
+    // Check connection state
+    if (ltpConnectionState !== ConnectionState.READY) {
+      logger.warn(`Cannot process LTP subscriptions: WebSocket not ready (state: ${ltpConnectionState})`);
+      return;
+    }
+    
+    // Group tokens by exchange for subscription
+    const tokensByExchange = new Map(); // exchangeType -> array of tokens
+    
+    // Process all subscriptions
+    for (const [token, planIds] of subscriptions.entries()) {
+      if (planIds.size === 0) continue;
+      
+      // Get symbol for the token
+      const symbol = tokenToSymbolMap.get(token);
+      if (!symbol) {
+        logger.warn(`Cannot find symbol for token ${token}`);
+        continue;
+      }
+      
+      // Get exchange type for this symbol
+      const plan = findOrderPlanBySymbolSync(symbol);
+      if (!plan) {
+        logger.warn(`Cannot find order plan for symbol ${symbol}`);
+        continue;
+      }
+      
+      const exchangeType = mapExchangeToType(plan.exchange);
+      
+      // Add to tokens by exchange map
+      if (!tokensByExchange.has(exchangeType)) {
+        tokensByExchange.set(exchangeType, []);
+      }
+      
+      tokensByExchange.get(exchangeType).push(parseInt(token, 10));
+    }
+    
+    // If no tokens to subscribe, return
+    if (tokensByExchange.size === 0) {
+      logger.info('No tokens to subscribe to for LTP');
+      return;
+    }
+    
+    // Build token list for subscription
+    const tokenList = [];
+    for (const [exchangeType, tokens] of tokensByExchange.entries()) {
+      tokenList.push({
+        exchangeType,
+        tokens
+      });
+    }
+    
+    // Create subscription message
+    const subscriptionMessage = {
+      correlationID: "ltp_subscription_" + Date.now(),
+      action: 1, // SUBSCRIBE
+      params: {
+        mode: 1, // LTP mode
+        tokenList
+      }
+    };
+    
+    // Log subscription summary
+    const tokenCount = tokenList.reduce((sum, item) => sum + item.tokens.length, 0);
+    logger.info(`Subscribing to ${tokenCount} tokens across ${tokenList.length} exchanges for LTP`);
+    
+    // Send subscription
+    if (wsLTP && wsLTP.readyState === WebSocket.OPEN) {
+      wsLTP.send(JSON.stringify(subscriptionMessage));
+      logger.info(`Subscribed to ${tokensByExchange.size} exchanges with ${tokenCount} tokens for LTP`);
+    } else {
+      logger.error('LTP WebSocket not connected, cannot subscribe');
+    }
+  } catch (error) {
+    logger.error('Error processing LTP subscriptions:', error);
+  }
+}
+
+
+/**
+ * Handle LTP WebSocket messages
+ * @param {any} data - Message data
+ */
+function handleLTPWebSocketMessage(data) {
+  try {
+    // Update last message time
+    ltpLastMessageTime = Date.now();
+    // Handle binary data
+    if (data instanceof Buffer || data instanceof ArrayBuffer) {
+      try {
+        // Get size for logging
+        const size = data instanceof Buffer ? data.length : data.byteLength;
+        logger.debug(`Received LTP WebSocket message: ${data instanceof Buffer ? 'Buffer' : 'ArrayBuffer'}, size: ${size} bytes`);
+        
+        // Get first byte for message type detection
+        const bytes = data instanceof Buffer ? 
+          new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : 
+          new Uint8Array(data);
+        
+        if (bytes.length === 0) {
+          logger.warn('Received empty binary message');
+          return;
+        }
+        
+        const firstByte = bytes[0];
+        
+        // Check message type
+        if (firstByte === 1) {
+          // This is an LTP mode market data message
+          const tickData = handleDataTicks(data);
+          
+          if (!tickData) {
+            logger.warn('handleDataTicks returned null or undefined');
+            return;
+          }
+          
+          if (tickData.error) {
+            logger.warn(`Error in tick data: ${tickData.error}`);
+            return;
+          }
+          
+          if (!tickData.token) {
+            logger.warn('Tick data missing token');
+            return;
+          }
+          
+          // Process the tick data
+          const token = tickData.token;
+          logger.debug(`Processed LTP market data for token ${token}`);
+          
+          // Create a simplified tick object for existing code
+          const simpleTick = {
+            token,
+            ltp: tickData.lastTradedPrice || 0,
+            open: tickData.openPrice || 0,
+            high: tickData.highPrice || 0,
+            low: tickData.lowPrice || 0,
+            close: tickData.closePrice || 0,
+            totalTradedQty: tickData.volumeTradedToday || 0,
+            totBuyQty: tickData.totalBuyQuantity || 0,
+            totSellQty: tickData.totalSellQuantity || 0,
+            sequenceNumber: tickData.sequenceNumber,
+            exchangeTimestamp: tickData.exchangeTimestamp
+          };
+          
+          // Store last tick data
+          lastTicks.set(token, simpleTick);
+          
+          // Update symbol price in Redis and order plans
+          const symbol = tokenToSymbolMap.get(token);
+          if (symbol) {
+            updateSymbolPrice(symbol, token, simpleTick)
+              .catch(err => logger.error(`Async error updating symbol price: ${err.message}`));
+            
+            // Update order plans that use this symbol
+            if (subscriptions.has(token)) {
+              const planIds = subscriptions.get(token);
+              for (const planId of planIds) {
+                if (planId) {
+                  updateOrderPlanPrice(planId, simpleTick)
+                    .catch(err => logger.error(`Async error updating order plan: ${err.message}`));
+                }
+              }
+            }
+            
+            // Calculate price change for logging
+            const priceChange = simpleTick.close > 0 ? 
+              ((simpleTick.ltp - simpleTick.close) / simpleTick.close * 100).toFixed(2) + '%' : 
+              'N/A';
+            
+            logger.info(`LTP data for ${symbol}: LTP=${simpleTick.ltp}, Change=${priceChange}`);
+          } else {
+            logger.debug(`No symbol mapping found for token ${token}`);
+          }
+        } 
+        else if (bytes.length > 2 && bytes[2] === 0x37) {
+          // This looks like an acknowledgment message
+          handleAcknowledgmentMessage(data);
+        }
+      } catch (binaryError) {
+        logger.error(`Error processing LTP binary message: ${binaryError.message}`);
+        console.error('Stack trace:', binaryError.stack);
+      }
+      return;
+    }
+    
+    // Handle text messages (could be acknowledgments, errors, etc.)
+    try {
+      const message = JSON.parse(data.toString());
+      logger.debug(`Received LTP text message: ${JSON.stringify(message)}`);
+      
+      // Handle authentication response
+      if (message.action === 1 && message.response) {
+        if (message.response.status) {
+          logger.info('LTP WebSocket authentication successful');
+          ltpConnectionState = ConnectionState.AUTHENTICATED;
+        } else {
+          logger.error(`LTP WebSocket authentication failed: ${message.response.message || 'Unknown error'}`);
+          ltpConnectionState = ConnectionState.DISCONNECTED;
+          if (wsLTP) wsLTP.close();
+        }
+      }
+    } catch (textError) {
+      logger.error(`Error processing LTP text message: ${textError.message}`);
+    }
+    
+  } catch (error) {
+    logger.error(`Error handling LTP WebSocket message: ${error.message}`);
+    if (error.stack) {
+      logger.debug(`Stack trace: ${error.stack}`);
+    }
+  }
+}
+
+/**
+ * Send authentication message for LTP WebSocket
+ * @param {Object} session - Session information
+ */
+function sendLTPAuthenticationMessage(session) {
+  try {
+    const authMessage = {
+      correlationID: "ltp_websocket_" + Date.now(),
+      action: 1, // AUTHENTICATE
+      params: {
+        clientCode: config.angelOneWebSocket.clientId,
+        authorization: session.jwtToken
+      }
+    };
+    
+    logger.info('Sending authentication message to LTP WebSocket');
+    wsLTP.send(JSON.stringify(authMessage));
+    ltpConnectionState = ConnectionState.AUTHENTICATING;
+  } catch (error) {
+    logger.error('Error sending authentication message to LTP WebSocket:', error);
+    if (wsLTP) wsLTP.close();
+  }
+}
+
+/**
+ * Close LTP WebSocket connection and clear intervals
+ */
+function closeLTPConnection() {
+  if (wsLTP) {
+    try {
+      wsLTP.terminate();
+    } catch (err) {
+      logger.warn(`Error terminating existing LTP WebSocket: ${err.message}`);
+    }
+    wsLTP = null;
+  }
+  
+  // Clear intervals specific to LTP connection
+  clearLTPIntervals();
+}
+
+/**
+ * Clear intervals for LTP WebSocket
+ */
+function clearLTPIntervals() {
+  try {
+    // Clear ping interval
+    if (ltpPingInterval) {
+      clearInterval(ltpPingInterval);
+      ltpPingInterval = null;
+    }
+    
+    // Clear market data request interval
+    if (ltpMarketDataRequestInterval) {
+      clearInterval(ltpMarketDataRequestInterval);
+      ltpMarketDataRequestInterval = null;
+    }
+    
+    // Clear connection health check interval
+    if (ltpConnectionHealthCheckInterval) {
+      clearInterval(ltpConnectionHealthCheckInterval);
+      ltpConnectionHealthCheckInterval = null;
+    }
+    
+    // Clear buffer cleanup interval
+    if (ltpBufferCleanupInterval) {
+      clearInterval(ltpBufferCleanupInterval);
+      ltpBufferCleanupInterval = null;
+    }
+    
+    // Clear message assembly timeout
+    if (ltpMessageAssemblyTimeout) {
+      clearTimeout(ltpMessageAssemblyTimeout);
+      ltpMessageAssemblyTimeout = null;
+    }
+    
+    // Reset buffer
+    ltpBinaryMessageBuffer = null;
+    ltpExpectedMessageLength = null;
+    
+    logger.info('LTP WebSocket intervals cleared');
+  } catch (error) {
+    logger.error(`Error clearing LTP intervals: ${error.message}`);
+  }
+}
+
+
+/**
+ * Connect Market Depth WebSocket (Mode 3)
+ * @param {Object} session - Authentication session with jwtToken and feedToken
+ * @returns {Promise<void>}
+ */
+function connectMarketDepthWebSocket(session) {
+  return new Promise((resolve, reject) => {
+    try {
+      // Validate session
+      if (!session || !session.jwtToken) {
+        throw new Error('Invalid session: missing JWT token');
+      }
+      
+      // Close existing connection if any
+      closeMarketDepthConnection();
+      
+      // Update connection state
+      depthConnectionState = ConnectionState.CONNECTING;
+      logger.info('Market Depth WebSocket connection state:', depthConnectionState);
+      
+      // Create new WebSocket connection
+      const wsUrl = config.angelOne.wsUrl || 'wss://smartapisocket.angelone.in/smart-stream';
+      logger.info(`Connecting to Market Depth WebSocket at ${wsUrl}`);
+      
+      // Create headers
+      const headers = {
+        'Authorization': `Bearer ${session.jwtToken}`,
+        'x-api-key': config.angelOne.apiKey,
+        'x-client-code': config.angelOneWebSocket.clientId,
+        'x-feed-token': session.feedToken || session.jwtToken
+      };
+      
+      wsMarketDepth = new WebSocket(wsUrl, { headers });
+      
+      // Set binary type
+      wsMarketDepth.binaryType = 'arraybuffer';
+      
+      // Set connection timeout
+      const connectionTimeout = setTimeout(() => {
+        if (depthConnectionState !== ConnectionState.READY) {
+          logger.error('Market Depth WebSocket connection timeout after 30 seconds');
+          depthConnectionState = ConnectionState.DISCONNECTED;
+          
+          if (wsMarketDepth) {
+            try {
+              wsMarketDepth.terminate();
+            } catch (err) {
+              logger.warn(`Error terminating Market Depth WebSocket: ${err.message}`);
+            }
+            wsMarketDepth = null;
+          }
+          
+          reject(new Error('Market Depth WebSocket connection timeout'));
+        }
+      }, 30000);
+      
+      // Set up event handlers
+      setupMarketDepthEventHandlers(resolve, reject, connectionTimeout, session);
+      
+    } catch (error) {
+      logger.error('Error connecting to Market Depth WebSocket:', error);
+      
+      // Update state
+      depthConnectionState = ConnectionState.DISCONNECTED;
+      logger.info('Market Depth WebSocket connection state:', depthConnectionState);
+      
+      reject(error);
+    }
+  });
+}
+
+
+/**
+ * Set up Market Depth WebSocket event handlers
+ * @param {Function} resolve - Promise resolve function
+ * @param {Function} reject - Promise reject function
+ * @param {Timeout} connectionTimeout - Connection timeout
+ * @param {Object} session - Session information
+ */
+function setupMarketDepthEventHandlers(resolve, reject, connectionTimeout, session) {
+  wsMarketDepth.on('open', () => {
+    logger.info('Market Depth WebSocket connection established');
+    
+    // Set up intervals
+    setupMarketDepthIntervals();
+    
+    // Send authentication message
+    sendMarketDepthAuthenticationMessage(session);
+  });
+  
+  wsMarketDepth.on('message', (data) => {
+    try {
+      handleMarketDepthWebSocketMessage(data);
+    } catch (err) {
+      logger.error(`Error in Market Depth message handler: ${err.message}`);
+      if (err.stack) logger.debug(`Stack trace: ${err.stack}`);
+    }
+  });
+  
+  wsMarketDepth.on('error', (error) => {
+    logger.error('Market Depth WebSocket error:', error);
+    
+    // Clear connection timeout
+    clearTimeout(connectionTimeout);
+    
+    // Update state
+    depthConnectionState = ConnectionState.DISCONNECTED;
+    logger.info('Market Depth WebSocket connection state:', depthConnectionState);
+    
+    // Reject the promise if we're still connecting
+    reject(error);
+  });
+  
+  wsMarketDepth.on('close', (code, reason) => {
+    logger.warn(`Market Depth WebSocket connection closed: ${code} ${reason}`);
+    
+    // Clear connection timeout
+    clearTimeout(connectionTimeout);
+    
+    // Update state
+    depthConnectionState = ConnectionState.DISCONNECTED;
+    logger.info('Market Depth WebSocket connection state:', depthConnectionState);
+    
+    // Clear intervals
+    clearMarketDepthIntervals();
+    
+    // Handle reconnect
+    handleMarketDepthReconnect();
+  });
+  
+  // Set up a special handler to update connection state to READY after authentication
+  setTimeout(() => {
+    if (depthConnectionState === ConnectionState.AUTHENTICATED || depthConnectionState === ConnectionState.CONNECTING) {
+      logger.info('Setting Market Depth connection state to READY after timeout');
+      depthConnectionState = ConnectionState.READY;
+      
+      // Process subscriptions for Market Depth
+      try {
+        processMarketDepthSubscriptions();
+      } catch (err) {
+        logger.error(`Error processing Market Depth subscriptions: ${err.message}`);
+      }
+      
+      // Resolve the promise
+      resolve();
+    }
+  }, 5000); // 5 second timeout
+}
+
+/**
+ * Set up maintenance intervals for Market Depth WebSocket
+ */
+function setupMarketDepthIntervals() {
+  try {
+    // Update time trackers
+    depthLastMessageTime = Date.now();
+    depthLastPongTime = Date.now();
+    
+    // Set up ping interval
+    depthPingInterval = setInterval(() => {
+      if (wsMarketDepth && wsMarketDepth.readyState === WebSocket.OPEN) {
+        try {
+          logger.debug('Sending ping to keep Market Depth WebSocket alive');
+          wsMarketDepth.ping();
+        } catch (err) {
+          logger.warn(`Error sending ping to Market Depth WebSocket: ${err.message}`);
+        }
+      }
+    }, 30000); // Every 30 seconds
+    
+    // Set up market data request interval
+    depthMarketDataRequestInterval = setInterval(() => {
+      if (depthConnectionState === ConnectionState.READY && wsMarketDepth && wsMarketDepth.readyState === WebSocket.OPEN) {
+        try {
+          requestMarketDepthData();
+        } catch (err) {
+          logger.warn(`Error requesting Market Depth data: ${err.message}`);
+        }
+      }
+    }, 60000); // Every 60 seconds
+    
+    // Set up connection health check
+    depthConnectionHealthCheckInterval = setInterval(() => {
+      try {
+        checkMarketDepthConnectionHealth();
+      } catch (err) {
+        logger.warn(`Error checking Market Depth connection health: ${err.message}`);
+      }
+    }, 60000); // Every 60 seconds
+    
+    // Set up buffer cleanup interval
+    depthBufferCleanupInterval = setInterval(() => {
+      try {
+        cleanupMarketDepthMessageBuffers();
+      } catch (err) {
+        logger.warn(`Error cleaning up Market Depth message buffers: ${err.message}`);
+      }
+    }, 10000); // Every 10 seconds
+    
+    logger.info('Market Depth WebSocket intervals set up');
+  } catch (error) {
+    logger.error(`Error setting up Market Depth intervals: ${error.message}`);
+  }
+}
+
+/**
+ * Clean up Market Depth message buffers
+ */
+function cleanupMarketDepthMessageBuffers() {
+  try {
+    if (depthBinaryMessageBuffer && depthExpectedMessageLength) {
+      const now = Date.now();
+      const bufferAge = now - depthLastMessageTime;
+      
+      // If buffer is older than 30 seconds, clean it up
+      if (bufferAge > 30000) {
+        logger.warn(`Cleaning up stale Market Depth message buffer (age: ${bufferAge}ms)`);
+        
+        // Reset buffer state
+        depthBinaryMessageBuffer = null;
+        depthExpectedMessageLength = null;
+        
+        // Clear timeout
+        if (depthMessageAssemblyTimeout) {
+          clearTimeout(depthMessageAssemblyTimeout);
+          depthMessageAssemblyTimeout = null;
+        }
+      }
+    }
+  } catch (error) {
+    logger.error(`Error cleaning up Market Depth message buffers: ${error.message}`);
+  }
+}
+
+/**
+ * Check Market Depth connection health
+ */
+function checkMarketDepthConnectionHealth() {
+  try {
+    if (!wsMarketDepth) {
+      logger.warn('No Market Depth WebSocket connection to check');
+      return;
+    }
+    
+    const now = Date.now();
+    const timeSinceLastMessage = now - depthLastMessageTime;
+    const timeSinceLastPong = now - depthLastPongTime;
+    
+    logger.debug(`Market Depth connection health: Last message ${timeSinceLastMessage}ms ago, last pong ${timeSinceLastPong}ms ago`);
+    
+    // If no message for 5 minutes, reconnect
+    if (timeSinceLastMessage > 5 * 60 * 1000) {
+      logger.warn(`No Market Depth messages received for ${Math.floor(timeSinceLastMessage/1000)}s, reconnecting...`);
+      reconnectMarketDepthWebSocket();
+    }
+    
+    // If no pong for 2 minutes, reconnect
+    if (timeSinceLastPong > 2 * 60 * 1000) {
+      logger.warn(`No Market Depth pong received for ${Math.floor(timeSinceLastPong/1000)}s, reconnecting...`);
+      reconnectMarketDepthWebSocket();
+    }
+  } catch (error) {
+    logger.error(`Error checking Market Depth connection health: ${error.message}`);
+  }
+}
+
+/**
+ * Reconnect Market Depth WebSocket
+ */
+function reconnectMarketDepthWebSocket() {
+  try {
+    logger.info('Initiating Market Depth WebSocket reconnection');
+    
+    // Close existing connection
+    closeMarketDepthConnection();
+    
+    // Update state
+    depthConnectionState = ConnectionState.RECONNECTING;
+    logger.info('Market Depth WebSocket connection state:', depthConnectionState);
+    
+    // Re-authenticate
+    authenticate()
+      .then(newSession => connectMarketDepthWebSocket(newSession))
+      .then(() => {
+        logger.info('Market Depth WebSocket reconnection successful');
+        
+        // Resubscribe to tokens
+        processMarketDepthSubscriptions();
+      })
+      .catch(error => {
+        logger.error('Market Depth WebSocket reconnection failed:', error);
+        
+        // Schedule another reconnect attempt if within limits
+        if (depthReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          handleMarketDepthReconnect();
+        } else {
+          logger.error('Maximum Market Depth reconnection attempts reached. Giving up.');
+        }
+      });
+  } catch (error) {
+    logger.error('Error in reconnectMarketDepthWebSocket:', error);
+  }
+}
+
+
+/**
+ * Request Market Depth data for all subscribed tokens
+ */
+function requestMarketDepthData() {
+  try {
+    if (depthConnectionState !== ConnectionState.READY || !wsMarketDepth || wsMarketDepth.readyState !== WebSocket.OPEN) {
+      logger.warn(`Cannot request Market Depth data: WebSocket not ready (state: ${depthConnectionState})`);
+      return;
+    }
+    
+    // Group tokens by exchange
+    const tokensByExchange = new Map(); // exchangeType -> array of tokens
+    
+    // Process all subscriptions
+    for (const [token, planIds] of subscriptions.entries()) {
+      if (planIds.size === 0) continue;
+      
+      // Get symbol for the token
+      const symbol = tokenToSymbolMap.get(token);
+      if (!symbol) {
+        logger.warn(`Cannot find symbol for token ${token}`);
+        continue;
+      }
+      
+      // Get exchange type for this symbol
+      const plan = findOrderPlanBySymbolSync(symbol);
+      if (!plan) {
+        logger.warn(`Cannot find order plan for symbol ${symbol}`);
+        continue;
+      }
+      
+      const exchangeType = mapExchangeToType(plan.exchange);
+      
+      // Add to tokens by exchange map
+      if (!tokensByExchange.has(exchangeType)) {
+        tokensByExchange.set(exchangeType, []);
+      }
+      
+      tokensByExchange.get(exchangeType).push(parseInt(token, 10));
+    }
+    
+    // If no tokens to request, return
+    if (tokensByExchange.size === 0) {
+      logger.debug('No tokens to request Market Depth data for');
+      return;
+    }
+    
+    // Build token list for request
+    const tokenList = [];
+    for (const [exchangeType, tokens] of tokensByExchange.entries()) {
+      tokenList.push({
+        exchangeType,
+        tokens
+      });
+    }
+    
+    // Create request message
+    const requestMessage = {
+      correlationID: "marketdepth_request_" + Date.now(),
+      action: 2, // MARKET_DATA_REQUEST
+      params: {
+        mode: 3, // Snap Quote mode
+        tokenList
+      }
+    };
+    
+    // Log request summary
+    const tokenCount = tokenList.reduce((sum, item) => sum + item.tokens.length, 0);
+    logger.info(`Requesting Market Depth data for ${tokenCount} tokens across ${tokenList.length} exchanges`);
+    
+    // Send request
+    wsMarketDepth.send(JSON.stringify(requestMessage));
+  } catch (error) {
+    logger.error('Error requesting Market Depth data:', error);
+  }
+}
+
+/**
+ * Process subscriptions for Market Depth WebSocket
+ */
+function processMarketDepthSubscriptions() {
+  try {
+    logger.info('Processing Market Depth subscriptions');
+    
+    // Check connection state
+    if (depthConnectionState !== ConnectionState.READY) {
+      logger.warn(`Cannot process Market Depth subscriptions: WebSocket not ready (state: ${depthConnectionState})`);
+      return;
+    }
+    
+    // Group tokens by exchange for subscription
+    const tokensByExchange = new Map(); // exchangeType -> array of tokens
+    
+    // Process all subscriptions
+    for (const [token, planIds] of subscriptions.entries()) {
+      if (planIds.size === 0) continue;
+      
+      // Get symbol for the token
+      const symbol = tokenToSymbolMap.get(token);
+      if (!symbol) {
+        logger.warn(`Cannot find symbol for token ${token}`);
+        continue;
+      }
+      
+      // Get exchange type for this symbol
+      const plan = findOrderPlanBySymbolSync(symbol);
+      if (!plan) {
+        logger.warn(`Cannot find order plan for symbol ${symbol}`);
+        continue;
+      }
+      
+      const exchangeType = mapExchangeToType(plan.exchange);
+      
+      // Add to tokens by exchange map
+      if (!tokensByExchange.has(exchangeType)) {
+        tokensByExchange.set(exchangeType, []);
+      }
+      
+      tokensByExchange.get(exchangeType).push(parseInt(token, 10));
+    }
+    
+    // If no tokens to subscribe, return
+    if (tokensByExchange.size === 0) {
+      logger.info('No tokens to subscribe to for Market Depth');
+      return;
+    }
+    
+    // Build token list for subscription
+    const tokenList = [];
+    for (const [exchangeType, tokens] of tokensByExchange.entries()) {
+      tokenList.push({
+        exchangeType,
+        tokens
+      });
+    }
+    
+    // Create subscription message
+    const subscriptionMessage = {
+      correlationID: "marketdepth_subscription_" + Date.now(),
+      action: 1, // SUBSCRIBE
+      params: {
+        mode: 3, // Snap Quote mode
+        tokenList
+      }
+    };
+    
+    // Log subscription summary
+    const tokenCount = tokenList.reduce((sum, item) => sum + item.tokens.length, 0);
+    logger.info(`Subscribing to ${tokenCount} tokens across ${tokenList.length} exchanges for Market Depth`);
+    
+    // Send subscription
+    if (wsMarketDepth && wsMarketDepth.readyState === WebSocket.OPEN) {
+      wsMarketDepth.send(JSON.stringify(subscriptionMessage));
+      logger.info(`Subscribed to ${tokensByExchange.size} exchanges with ${tokenCount} tokens for Market Depth`);
+    } else {
+      logger.error('Market Depth WebSocket not connected, cannot subscribe');
+    }
+  } catch (error) {
+    logger.error('Error processing Market Depth subscriptions:', error);
+  }
+}
+
+/**
+ * Update handlers for pong messages to track pong receipt time
+ */
+function setupLTPPongHandler() {
+  wsLTP.on('pong', () => {
+    logger.debug('Received pong from LTP server');
+    ltpLastPongTime = Date.now();
+  });
+}
+
+function setupMarketDepthPongHandler() {
+  wsMarketDepth.on('pong', () => {
+    logger.debug('Received pong from Market Depth server');
+    depthLastPongTime = Date.now();
+  });
+}
+
+/**
+ * Handle Market Depth WebSocket messages
+ * @param {any} data - Message data
+ */
+function handleMarketDepthWebSocketMessage(data) {
+  try {
+    // Update last message time
+    depthLastMessageTime = Date.now();
+    // Handle binary data
+    if (data instanceof Buffer || data instanceof ArrayBuffer) {
+      try {
+        // Get size for logging
+        const size = data instanceof Buffer ? data.length : data.byteLength;
+        logger.debug(`Received Market Depth WebSocket message: ${data instanceof Buffer ? 'Buffer' : 'ArrayBuffer'}, size: ${size} bytes`);
+        
+        // Get first byte for message type detection
+        const bytes = data instanceof Buffer ? 
+          new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : 
+          new Uint8Array(data);
+        
+        if (bytes.length === 0) {
+          logger.warn('Received empty binary message');
+          return;
+        }
+        
+        const firstByte = bytes[0];
+        
+        // Check message type
+        if (firstByte === 3) {  // Snap Quote mode
+          const buffer = data instanceof Buffer ? data : Buffer.from(data);
+          
+          // Parse the Snap Quote data
+          const snapQuoteData = parseSnapQuoteData(buffer);
+          if (!snapQuoteData) {
+            logger.warn('parseSnapQuoteData returned null or undefined');
+            return;
+          }
+          
+          const token = snapQuoteData.token;
+          
+          // Update symbol price in Redis and order plans
+          const symbol = tokenToSymbolMap.get(token);
+          if (symbol) {
+            logger.info(`Received Snap Quote with Best Five Data for ${symbol}`);
+            
+            // Update market depth
+            updateMarketDepth(symbol, token, snapQuoteData)
+              .catch(err => logger.error(`Error updating market depth: ${err.message}`));
+          } else {
+            logger.debug(`No symbol mapping found for token ${token} in Snap Quote`);
+          }
+        }
+        else if (bytes.length > 2 && bytes[2] === 0x37) {
+          // This looks like an acknowledgment message
+          handleAcknowledgmentMessage(data);
+        }
+      } catch (binaryError) {
+        logger.error(`Error processing Market Depth binary message: ${binaryError.message}`);
+        console.error('Stack trace:', binaryError.stack);
+      }
+      return;
+    }
+    
+    // Handle text messages (could be acknowledgments, errors, etc.)
+    try {
+      const message = JSON.parse(data.toString());
+      logger.debug(`Received Market Depth text message: ${JSON.stringify(message)}`);
+      
+      // Handle authentication response
+      if (message.action === 1 && message.response) {
+        if (message.response.status) {
+          logger.info('Market Depth WebSocket authentication successful');
+          depthConnectionState = ConnectionState.AUTHENTICATED;
+        } else {
+          logger.error(`Market Depth WebSocket authentication failed: ${message.response.message || 'Unknown error'}`);
+          depthConnectionState = ConnectionState.DISCONNECTED;
+          if (wsMarketDepth) wsMarketDepth.close();
+        }
+      }
+    } catch (textError) {
+      logger.error(`Error processing Market Depth text message: ${textError.message}`);
+    }
+    
+  } catch (error) {
+    logger.error(`Error handling Market Depth WebSocket message: ${error.message}`);
+    if (error.stack) {
+      logger.debug(`Stack trace: ${error.stack}`);
+    }
+  }
+}
+
+/**
+ * Send authentication message for Market Depth WebSocket
+ * @param {Object} session - Session information
+ */
+function sendMarketDepthAuthenticationMessage(session) {
+  try {
+    const authMessage = {
+      correlationID: "marketdepth_websocket_" + Date.now(),
+      action: 1, // AUTHENTICATE
+      params: {
+        clientCode: config.angelOneWebSocket.clientId,
+        authorization: session.jwtToken
+      }
+    };
+    
+    logger.info('Sending authentication message to Market Depth WebSocket');
+    wsMarketDepth.send(JSON.stringify(authMessage));
+    depthConnectionState = ConnectionState.AUTHENTICATING;
+  } catch (error) {
+    logger.error('Error sending authentication message to Market Depth WebSocket:', error);
+    if (wsMarketDepth) wsMarketDepth.close();
+  }
+}
+
+/**
+ * Close Market Depth WebSocket connection and clear intervals
+ */
+function closeMarketDepthConnection() {
+  if (wsMarketDepth) {
+    try {
+      wsMarketDepth.terminate();
+    } catch (err) {
+      logger.warn(`Error terminating existing Market Depth WebSocket: ${err.message}`);
+    }
+    wsMarketDepth = null;
+  }
+  
+  // Clear intervals specific to Market Depth connection
+  clearMarketDepthIntervals();
+}
+
+/**
+ * Clear intervals for Market Depth WebSocket
+ */
+function clearMarketDepthIntervals() {
+  try {
+    // Clear ping interval
+    if (depthPingInterval) {
+      clearInterval(depthPingInterval);
+      depthPingInterval = null;
+    }
+    
+    // Clear market data request interval
+    if (depthMarketDataRequestInterval) {
+      clearInterval(depthMarketDataRequestInterval);
+      depthMarketDataRequestInterval = null;
+    }
+    
+    // Clear connection health check interval
+    if (depthConnectionHealthCheckInterval) {
+      clearInterval(depthConnectionHealthCheckInterval);
+      depthConnectionHealthCheckInterval = null;
+    }
+    
+    // Clear buffer cleanup interval
+    if (depthBufferCleanupInterval) {
+      clearInterval(depthBufferCleanupInterval);
+      depthBufferCleanupInterval = null;
+    }
+    
+    // Clear message assembly timeout
+    if (depthMessageAssemblyTimeout) {
+      clearTimeout(depthMessageAssemblyTimeout);
+      depthMessageAssemblyTimeout = null;
+    }
+    
+    // Reset buffer
+    depthBinaryMessageBuffer = null;
+    depthExpectedMessageLength = null;
+    
+    logger.info('Market Depth WebSocket intervals cleared');
+  } catch (error) {
+    logger.error(`Error clearing Market Depth intervals: ${error.message}`);
+  }
+}
+
+/**
+ * Initialize WebSocket connection and subscriptions
+ */
+
+export async function initializeWebSocket() {
+  try {
+    // Authenticate with Angel Broking
+    const session = await authenticate();
+    
+    // Connect to WebSocket
+    await connectWebSocket(session);
+    
+    // Set up subscription refresh interval
+    setInterval(refreshSubscriptions, 60 * 60 * 1000); // Every hour
+    
+    // Initial subscription setup
+    await setupInitialSubscriptions();
+    
+    // Listen for new order plans using the subscriber connection
+    redisSubscriber.subscribe('orderplan:new');
+    redisSubscriber.subscribe('orderplan:delete');
+    
+    redisSubscriber.on('message', async (channel, message) => {
       if (channel === 'orderplan:new') {
         const planId = message;
         await subscribeToOrderPlan(planId);
@@ -133,7 +1556,6 @@ async function authenticate() {
       config.angelOneWebSocket.password,
       totp
     );
-
     
     if (!loginResponse.data || !loginResponse.data.jwtToken) {
       throw new Error('Authentication failed: Invalid response');
@@ -153,7 +1575,7 @@ async function authenticate() {
 }
 
 /**
- * Connect WebSocket with proper state management and error handling
+ * Connect WebSocket with proper state management
  * @param {Object} session - Authentication session with jwtToken and feedToken
  * @returns {Promise<void>}
  */
@@ -165,6 +1587,9 @@ function connectWebSocket(session) {
         throw new Error('Invalid session: missing JWT token');
       }
       
+      // Close existing connection if any
+      closeExistingConnection();
+      
       // Update connection state
       connectionState = ConnectionState.CONNECTING;
       logger.info('WebSocket connection state:', connectionState);
@@ -172,86 +1597,26 @@ function connectWebSocket(session) {
       // Store current session for later use
       currentSession = session;
       
-      // Close existing connection if any
-      if (ws) {
-        try {
-          ws.terminate();
-        } catch (err) {
-          logger.warn(`Error terminating existing WebSocket: ${err.message}`);
-        }
-        ws = null;
-      }
-      
       // Reset variables
-      binaryMessageBuffer = null;
-      expectedMessageLength = null;
-      
-      if (messageAssemblyTimeout) {
-        clearTimeout(messageAssemblyTimeout);
-        messageAssemblyTimeout = null;
-      }
-      
-      // Reset connection tracking
-      lastMessageTime = Date.now();
-      lastPongTime = Date.now();
-      reconnectAttempts = 0;
-      
-      // Clear intervals
-      if (pingInterval) {
-        clearInterval(pingInterval);
-        pingInterval = null;
-      }
-      
-      if (marketDataRequestInterval) {
-        clearInterval(marketDataRequestInterval);
-        marketDataRequestInterval = null;
-      }
-      
-      if (connectionHealthCheckInterval) {
-        clearInterval(connectionHealthCheckInterval);
-        connectionHealthCheckInterval = null;
-      }
-      
-      if (bufferCleanupInterval) {
-        clearInterval(bufferCleanupInterval);
-        bufferCleanupInterval = null;
-      }
-      
-      // Validate configuration before connecting
-      if (!config || !config.angelOne || !config.angelOneWebSocket) {
-        throw new Error('Invalid configuration: missing Angel One WebSocket config');
-      }
+      resetState();
       
       // Create new WebSocket connection
       const wsUrl = config.angelOne.wsUrl || 'wss://smartapisocket.angelone.in/smart-stream';
       logger.info(`Connecting to WebSocket at ${wsUrl}`);
       
-      // Validate required headers
-      if (!config.angelOne.apiKey) {
-        throw new Error('Missing API key in configuration');
-      }
-      
-      if (!config.angelOneWebSocket.clientId) {
-        throw new Error('Missing client ID in configuration');
-      }
-      
       // Create headers
       const headers = {
         'Authorization': `Bearer ${session.jwtToken}`,
         'x-api-key': config.angelOne.apiKey,
-        'x-client-code': config.angelOneWebSocket.clientId
+        'x-client-code': config.angelOneWebSocket.clientId,
+        'x-feed-token': session.feedToken || session.jwtToken
       };
       
-      // Add feed token if available
-      if (session.feedToken) {
-        headers['x-feed-token'] = session.feedToken;
-      } else {
-        headers['x-feed-token'] = session.jwtToken;
-        logger.warn('Using JWT token as feed token');
-      }
-      ws = new WebSocket(wsUrl, { headers: headers });
+      ws = new WebSocket(wsUrl, { headers });
+      
       // Set binary type
       ws.binaryType = 'arraybuffer';
+      
       // Set connection timeout
       const connectionTimeout = setTimeout(() => {
         if (connectionState !== ConnectionState.READY) {
@@ -272,182 +1637,8 @@ function connectWebSocket(session) {
       }, 30000);
       
       // Set up event handlers
-      ws.on('open', () => {
-        logger.info('WebSocket connection established');
-        
-        // Set up ping interval
-        pingInterval = setInterval(() => {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            try {
-              logger.debug('Sending ping to keep WebSocket alive');
-              ws.ping();
-            } catch (err) {
-              logger.warn(`Error sending ping: ${err.message}`);
-            }
-          }
-        }, 30000);
-        
-        // Set up market data request interval
-        marketDataRequestInterval = setInterval(() => {
-          if (connectionState === ConnectionState.READY && ws && ws.readyState === WebSocket.OPEN) {
-            try {
-              requestMarketData();
-            } catch (err) {
-              logger.warn(`Error requesting market data: ${err.message}`);
-            }
-          }
-        }, 60000);
-        
-        // Set up connection health check
-        connectionHealthCheckInterval = setInterval(() => {
-          try {
-            checkConnectionHealth();
-          } catch (err) {
-            logger.warn(`Error checking connection health: ${err.message}`);
-          }
-        }, 60000);
-        
-        // Set up buffer cleanup interval
-        bufferCleanupInterval = setInterval(() => {
-          try {
-            cleanupMessageBuffers();
-          } catch (err) {
-            logger.warn(`Error cleaning up message buffers: ${err.message}`);
-          }
-        }, 10000);
-        
-        // Send authentication message
-        try {
-          const authMessage = {
-            correlationID: "websocket_connection_" + Date.now(),
-            action: 1, // AUTHENTICATE
-            params: {
-              clientCode: config.angelOneWebSocket.clientId,
-              authorization: session.jwtToken
-            }
-          };
-          
-          logger.info('Sending authentication message to WebSocket');
-          ws.send(JSON.stringify(authMessage));
-        } catch (error) {
-          logger.error('Error sending authentication message:', error);
-          ws.close();
-        }
-      });
+      setupEventHandlers(resolve, reject, connectionTimeout);
       
-      ws.on('message', (data) => {
-        try {
-          handleWebSocketMessage(data);
-        } catch (err) {
-          logger.error(`Error in message handler: ${err.message}`);
-          if (err.stack) logger.debug(`Stack trace: ${err.stack}`);
-        }
-      });
-      
-      ws.on('error', (error) => {
-        logger.error('WebSocket error:', error);
-        
-        // Clear connection timeout
-        clearTimeout(connectionTimeout);
-        
-        // Update state
-        connectionState = ConnectionState.DISCONNECTED;
-        logger.info('WebSocket connection state:', connectionState);
-        
-        // Reject the promise if we're still connecting
-        if (reconnectAttempts === 0) {
-          reject(error);
-        }
-      });
-      
-      ws.on('close', (code, reason) => {
-        logger.warn(`WebSocket connection closed: ${code} ${reason}`);
-        
-        // Clear connection timeout
-        clearTimeout(connectionTimeout);
-        
-        // Update state
-        connectionState = ConnectionState.DISCONNECTED;
-        logger.info('WebSocket connection state:', connectionState);
-        
-        // Clear intervals
-        if (pingInterval) {
-          clearInterval(pingInterval);
-          pingInterval = null;
-        }
-        
-        if (marketDataRequestInterval) {
-          clearInterval(marketDataRequestInterval);
-          marketDataRequestInterval = null;
-        }
-        
-        if (connectionHealthCheckInterval) {
-          clearInterval(connectionHealthCheckInterval);
-          connectionHealthCheckInterval = null;
-        }
-        
-        if (bufferCleanupInterval) {
-          clearInterval(bufferCleanupInterval);
-          bufferCleanupInterval = null;
-        }
-        
-        // Reconnect with exponential backoff
-        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          reconnectAttempts++;
-          const delay = RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts - 1);
-          
-          logger.info(`Attempting to reconnect in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-          
-          connectionState = ConnectionState.RECONNECTING;
-          logger.info('WebSocket connection state:', connectionState);
-          
-          setTimeout(() => {
-            try {
-              authenticate()
-                .then(newSession => connectWebSocket(newSession))
-                .catch(err => logger.error('Reconnect failed:', err));
-            } catch (err) {
-              logger.error(`Error in reconnect logic: ${err.message}`);
-            }
-          }, delay);
-        } else {
-          logger.error('Maximum reconnection attempts reached. Giving up.');
-        }
-      });
-      
-      ws.on('pong', () => {
-        logger.debug('Received pong from server');
-        lastPongTime = Date.now();
-      });
-      
-      // Special handler to resolve the promise when authenticated
-      // This is handled in the message handler when we receive the authentication success message
-      
-      // Set up a special handler to update connection state to READY after authentication
-      // This is important to avoid a race condition
-      setTimeout(() => {
-        if (connectionState === ConnectionState.AUTHENTICATED || connectionState === ConnectionState.CONNECTING) {
-          logger.info('Setting connection state to READY after timeout');
-          connectionState = ConnectionState.READY;
-          
-          // Process pending subscriptions
-          try {
-            processPendingSubscriptions();
-          } catch (err) {
-            logger.error(`Error processing pending subscriptions: ${err.message}`);
-          }
-          
-          // Request market data
-          try {
-            requestMarketData();
-          } catch (err) {
-            logger.error(`Error requesting market data: ${err.message}`);
-          }
-          
-          // Resolve the promise
-          resolve();
-        }
-      }, 5000); // 5 second timeout
     } catch (error) {
       logger.error('Error connecting to WebSocket:', error);
       
@@ -460,6 +1651,713 @@ function connectWebSocket(session) {
   });
 }
 
+/**
+ * Close existing WebSocket connection and clear intervals
+ */
+function closeExistingConnection() {
+  if (ws) {
+    try {
+      ws.terminate();
+    } catch (err) {
+      logger.warn(`Error terminating existing WebSocket: ${err.message}`);
+    }
+    ws = null;
+  }
+  
+  // Clear intervals
+  clearIntervals();
+}
+
+/**
+ * Reset connection state variables
+ */
+function resetState() {
+  binaryMessageBuffer = null;
+  expectedMessageLength = null;
+  
+  if (messageAssemblyTimeout) {
+    clearTimeout(messageAssemblyTimeout);
+    messageAssemblyTimeout = null;
+  }
+  
+  // Reset connection tracking
+  lastMessageTime = Date.now();
+  lastPongTime = Date.now();
+  reconnectAttempts = 0;
+}
+
+/**
+ * Clear all intervals
+ */
+function clearIntervals() {
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
+  }
+  
+  if (marketDataRequestInterval) {
+    clearInterval(marketDataRequestInterval);
+    marketDataRequestInterval = null;
+  }
+  
+  if (connectionHealthCheckInterval) {
+    clearInterval(connectionHealthCheckInterval);
+    connectionHealthCheckInterval = null;
+  }
+  
+  if (bufferCleanupInterval) {
+    clearInterval(bufferCleanupInterval);
+    bufferCleanupInterval = null;
+  }
+}
+
+/**
+ * Set up WebSocket event handlers
+ * @param {Function} resolve - Promise resolve function
+ * @param {Function} reject - Promise reject function
+ * @param {Timeout} connectionTimeout - Connection timeout
+ */
+function setupEventHandlers(resolve, reject, connectionTimeout) {
+  ws.on('open', () => {
+    logger.info('WebSocket connection established');
+    
+    // Set up intervals
+    setupIntervals();
+    
+    // Send authentication message
+    sendAuthenticationMessage();
+  });
+  
+  ws.on('message', (data) => {
+    try {
+      handleWebSocketMessage(data);
+    } catch (err) {
+      logger.error(`Error in message handler: ${err.message}`);
+      if (err.stack) logger.debug(`Stack trace: ${err.stack}`);
+    }
+  });
+  
+  ws.on('error', (error) => {
+    logger.error('WebSocket error:', error);
+    
+    // Clear connection timeout
+    clearTimeout(connectionTimeout);
+    
+    // Update state
+    connectionState = ConnectionState.DISCONNECTED;
+    logger.info('WebSocket connection state:', connectionState);
+    
+    // Reject the promise if we're still connecting
+    if (reconnectAttempts === 0) {
+      reject(error);
+    }
+  });
+  
+  ws.on('close', (code, reason) => {
+    logger.warn(`WebSocket connection closed: ${code} ${reason}`);
+    
+    // Clear connection timeout
+    clearTimeout(connectionTimeout);
+    
+    // Update state
+    connectionState = ConnectionState.DISCONNECTED;
+    logger.info('WebSocket connection state:', connectionState);
+    
+    // Clear intervals
+    clearIntervals();
+    
+    // Reconnect with exponential backoff
+    handleReconnect();
+  });
+  
+  ws.on('pong', () => {
+    logger.debug('Received pong from server');
+    lastPongTime = Date.now();
+  });
+  
+  // Set up a special handler to update connection state to READY after authentication
+  // This is important to avoid a race condition
+  setTimeout(() => {
+    if (connectionState === ConnectionState.AUTHENTICATED || connectionState === ConnectionState.CONNECTING) {
+      logger.info('Setting connection state to READY after timeout');
+      connectionState = ConnectionState.READY;
+      
+      // Process pending subscriptions
+      try {
+        processPendingSubscriptions();
+      } catch (err) {
+        logger.error(`Error processing pending subscriptions: ${err.message}`);
+      }
+      
+      // Request market data
+      try {
+        requestMarketData();
+      } catch (err) {
+        logger.error(`Error requesting market data: ${err.message}`);
+      }
+      
+      // Resolve the promise
+      resolve();
+    }
+  }, 5000); // 5 second timeout
+}
+
+/**
+ * Set up maintenance intervals
+ */
+function setupIntervals() {
+  // Set up ping interval
+  pingInterval = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        logger.debug('Sending ping to keep WebSocket alive');
+        ws.ping();
+      } catch (err) {
+        logger.warn(`Error sending ping: ${err.message}`);
+      }
+    }
+  }, 30000);
+  
+  // Set up market data request interval
+  marketDataRequestInterval = setInterval(() => {
+    if (connectionState === ConnectionState.READY && ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        requestMarketData();
+      } catch (err) {
+        logger.warn(`Error requesting market data: ${err.message}`);
+      }
+    }
+  }, 60000);
+  
+  // Set up connection health check
+  connectionHealthCheckInterval = setInterval(() => {
+    try {
+      checkConnectionHealth();
+    } catch (err) {
+      logger.warn(`Error checking connection health: ${err.message}`);
+    }
+  }, 60000);
+  
+  // Set up buffer cleanup interval
+  bufferCleanupInterval = setInterval(() => {
+    try {
+      cleanupMessageBuffers();
+    } catch (err) {
+      logger.warn(`Error cleaning up message buffers: ${err.message}`);
+    }
+  }, 10000);
+}
+
+/**
+ * Send authentication message
+ */
+function sendAuthenticationMessage() {
+  try {
+    const authMessage = {
+      correlationID: "websocket_connection_" + Date.now(),
+      action: 1, // AUTHENTICATE
+      params: {
+        clientCode: config.angelOneWebSocket.clientId,
+        authorization: currentSession.jwtToken
+      }
+    };
+    
+    logger.info('Sending authentication message to WebSocket');
+    ws.send(JSON.stringify(authMessage));
+  } catch (error) {
+    logger.error('Error sending authentication message:', error);
+    if (ws) ws.close();
+  }
+}
+
+/**
+ * Handle LTP WebSocket reconnection with exponential backoff
+ */
+function handleLTPReconnect() {
+  if (ltpReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    ltpReconnectAttempts++;
+    const delay = RECONNECT_DELAY * Math.pow(1.5, ltpReconnectAttempts - 1);
+    
+    logger.info(`Attempting to reconnect LTP WebSocket in ${delay}ms (attempt ${ltpReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+    
+    ltpConnectionState = ConnectionState.RECONNECTING;
+    logger.info('LTP WebSocket connection state:', ltpConnectionState);
+    
+    setTimeout(() => {
+      try {
+        authenticate()
+          .then(newSession => connectLTPWebSocket(newSession))
+          .catch(err => logger.error('LTP reconnect failed:', err));
+      } catch (err) {
+        logger.error(`Error in LTP reconnect logic: ${err.message}`);
+      }
+    }, delay);
+  } else {
+    logger.error('Maximum LTP reconnection attempts reached. Giving up.');
+  }
+}
+
+
+
+/**
+ * Handle Market Depth WebSocket reconnection with exponential backoff
+ */
+function handleMarketDepthReconnect() {
+  if (depthReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    depthReconnectAttempts++;
+    const delay = RECONNECT_DELAY * Math.pow(1.5, depthReconnectAttempts - 1);
+    
+    logger.info(`Attempting to reconnect Market Depth WebSocket in ${delay}ms (attempt ${depthReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+    
+    depthConnectionState = ConnectionState.RECONNECTING;
+    logger.info('Market Depth WebSocket connection state:', depthConnectionState);
+    
+    setTimeout(() => {
+      try {
+        authenticate()
+          .then(newSession => connectMarketDepthWebSocket(newSession))
+          .catch(err => logger.error('Market Depth reconnect failed:', err));
+      } catch (err) {
+        logger.error(`Error in Market Depth reconnect logic: ${err.message}`);
+      }
+    }, delay);
+  } else {
+    logger.error('Maximum Market Depth reconnection attempts reached. Giving up.');
+  }
+}
+
+/**
+ * Handle reconnection with exponential backoff
+ */
+function handleReconnect() {
+  if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    reconnectAttempts++;
+    const delay = RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts - 1);
+    
+    logger.info(`Attempting to reconnect in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+    
+    connectionState = ConnectionState.RECONNECTING;
+    logger.info('WebSocket connection state:', connectionState);
+    
+    setTimeout(() => {
+      try {
+        authenticate()
+          .then(newSession => connectWebSocket(newSession))
+          .catch(err => logger.error('Reconnect failed:', err));
+      } catch (err) {
+        logger.error(`Error in reconnect logic: ${err.message}`);
+      }
+    }, delay);
+  } else {
+    logger.error('Maximum reconnection attempts reached. Giving up.');
+  }
+}
+
+/**
+ * Handle WebSocket messages
+ * @param {any} data - Message data
+ */
+function handleWebSocketMessage(data) {
+  try {
+    // Update last message time
+    lastMessageTime = Date.now();
+    
+    // Handle binary data
+    if (data instanceof Buffer || data instanceof ArrayBuffer) {
+      try {
+        // Get size for logging
+        const size = data instanceof Buffer ? data.length : data.byteLength;
+        logger.debug(`Received WebSocket message: ${data instanceof Buffer ? 'Buffer' : 'ArrayBuffer'}, size: ${size} bytes`);
+        
+        // Get first byte for message type detection
+        const bytes = data instanceof Buffer ? 
+          new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : 
+          new Uint8Array(data);
+        
+        if (bytes.length === 0) {
+          logger.warn('Received empty binary message');
+          return;
+        }
+        
+        const firstByte = bytes[0];
+        
+        // Check message type
+        if (size === 51 && firstByte === 1) {
+          // This is an LTP mode market data message
+          const tickData = handleDataTicks(data);
+          
+          if (!tickData) {
+            logger.warn('handleDataTicks returned null or undefined');
+            return;
+          }
+          
+          if (tickData.error) {
+            logger.warn(`Error in tick data: ${tickData.error}`);
+            return;
+          }
+          
+          if (!tickData.token) {
+            logger.warn('Tick data missing token');
+            return;
+          }
+          
+          // Process the tick data
+          const token = tickData.token;
+          logger.debug(`Processed LTP market data for token ${token}`);
+          
+          // Create a simplified tick object for existing code
+          const simpleTick = {
+            token,
+            ltp: tickData.lastTradedPrice || 0,
+            open: tickData.openPrice || 0,
+            high: tickData.highPrice || 0,
+            low: tickData.lowPrice || 0,
+            close: tickData.closePrice || 0,
+            totalTradedQty: tickData.volumeTradedToday || 0,
+            totBuyQty: tickData.totalBuyQuantity || 0,
+            totSellQty: tickData.totalSellQuantity || 0,
+            sequenceNumber: tickData.sequenceNumber,
+            exchangeTimestamp: tickData.exchangeTimestamp
+          };
+          
+          // Store last tick data
+          lastTicks.set(token, simpleTick);
+          
+          // Update symbol price in Redis and order plans
+          const symbol = tokenToSymbolMap.get(token);
+          if (symbol) {
+            updateSymbolPrice(symbol, token, simpleTick)
+              .catch(err => logger.error(`Async error updating symbol price: ${err.message}`));
+            
+            // Update order plans that use this symbol
+            if (subscriptions.has(token)) {
+              const planIds = subscriptions.get(token);
+              for (const planId of planIds) {
+                if (planId) {
+                  updateOrderPlanPrice(planId, simpleTick)
+                    .catch(err => logger.error(`Async error updating order plan: ${err.message}`));
+                }
+              }
+            }
+            
+            // Calculate price change for logging
+            const priceChange = simpleTick.close > 0 ? 
+              ((simpleTick.ltp - simpleTick.close) / simpleTick.close * 100).toFixed(2) + '%' : 
+              'N/A';
+            
+            logger.info(`Market data for ${symbol}: LTP=${simpleTick.ltp}, Change=${priceChange}`);
+          } else {
+            logger.debug(`No symbol mapping found for token ${token}`);
+          }
+        } 
+        else if (bytes.length > 2 && bytes[2] === 0x37) {
+          // This looks like an acknowledgment message
+          handleAcknowledgmentMessage(data);
+        }
+        else {
+          // Process other binary messages
+          processBinaryMessage(data);
+        }
+      } catch (binaryError) {
+        logger.error(`Error processing binary message: ${binaryError.message}`);
+        console.error('Stack trace:', binaryError.stack);
+      }
+      return;
+    }
+    
+    // Handle text messages...
+    // Rest of the code remains the same
+  } catch (error) {
+    logger.error(`Error handling WebSocket message: ${error.message}`);
+    if (error.stack) {
+      logger.debug(`Stack trace: ${error.stack}`);
+    }
+  }
+}
+
+/**
+ * Handle acknowledgment messages
+ * @param {Buffer|ArrayBuffer} data - The message data
+ */
+function handleAcknowledgmentMessage(data) {
+  try {
+    // Convert to ArrayBuffer if needed
+    const buffer = data instanceof Buffer ? 
+      data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : 
+      data;
+    
+    // Create views for reading the data
+    const bytes = new Uint8Array(buffer);
+    const dataView = new DataView(buffer);
+    
+    // Verify message type (byte 2 should be 0x37 = 55)
+    if (bytes[2] !== 0x37) {
+      logger.warn(`Expected message type 0x37, got 0x${bytes[2].toString(16)}`);
+      return;
+    }
+    
+    // Extract message ID (bytes 3-6)
+    let messageId = '';
+    for (let i = 3; i < 7; i++) {
+      if (bytes[i] >= 32 && bytes[i] <= 126) {
+        messageId += String.fromCharCode(bytes[i]);
+      }
+    }
+    
+    // Extract status code (bytes 38-39, observed from your data)
+    let statusCode = 0;
+    if (buffer.byteLength >= 40) {
+      statusCode = dataView.getUint16(38, true);
+    }
+    
+    logger.debug(`Acknowledgment message: ID=${messageId}, status=${statusCode} (0x${statusCode.toString(16)})`);
+    
+    // Handle status code
+    if (statusCode !== 0) {
+      switch (statusCode) {
+        case 307:
+          logger.info('Received status code 307 (temporary redirect), refreshing subscriptions');
+          // Schedule resubscription
+          setTimeout(() => {
+            resubscribeAll();
+          }, 2000);
+          break;
+          
+        case 4650: // 0x122A (observed in your logs)
+          logger.debug(`Received status code 4650 (0x122A), possibly a heartbeat`);
+          break;
+          
+        default:
+          logger.debug(`Received status code ${statusCode} (0x${statusCode.toString(16)})`);
+          break;
+      }
+    }
+  } catch (error) {
+    logger.error(`Error handling acknowledgment message: ${error.message}`);
+  }
+}
+
+
+/**
+ * Process general binary message
+ * @param {Buffer|ArrayBuffer} data - The message data
+ */
+function processBinaryMessage(data) {
+  const buffer = data instanceof Buffer ? data : Buffer.from(data);
+  
+  // Get message length and type for logging
+  const messageLength = buffer.length;
+  const messageType = buffer[0];
+  
+  logger.debug(`Binary message: length=${messageLength}, type=${messageType} (0x${messageType.toString(16)})`);
+  
+  // Handle different message types
+  if (messageType === 1) {
+    // LTP mode message
+    const tickData = handleDataTicks(buffer);
+    // Process tick data...
+  } 
+  else if (messageType === 3) {  // 0x3 = 3 in decimal - Snap Quote mode
+    try {
+      const snapQuoteData = parseSnapQuoteData(buffer);
+      if (!snapQuoteData) {
+        logger.warn('parseSnapQuoteData returned null or undefined');
+        return;
+      }
+      
+      const token = snapQuoteData.token;
+      
+      // Store last tick data
+      lastTicks.set(token, snapQuoteData);
+      
+      // Update symbol price in Redis and order plans
+      const symbol = tokenToSymbolMap.get(token);
+      if (symbol) {
+        logger.info(`Received Snap Quote with Best Five Data for ${symbol}`);
+        
+        // Create a simplified tick object for existing code
+        const simpleTick = {
+          token,
+          ltp: snapQuoteData.lastTradedPrice || 0,
+          open: snapQuoteData.openPrice || 0,
+          high: snapQuoteData.highPrice || 0,
+          low: snapQuoteData.lowPrice || 0,
+          close: snapQuoteData.closePrice || 0,
+          totalTradedQty: snapQuoteData.volumeTradedToday || 0,
+          totBuyQty: snapQuoteData.totalBuyQuantity || 0,
+          totSellQty: snapQuoteData.totalSellQuantity || 0,
+          sequenceNumber: snapQuoteData.sequenceNumber,
+          exchangeTimestamp: snapQuoteData.exchangeTimestamp,
+          bestFive: snapQuoteData.bestFive  // Include Best Five data
+        };
+        
+        // Update symbol price
+        updateSymbolPrice(symbol, token, simpleTick)
+          .catch(err => logger.error(`Async error updating symbol price: ${err.message}`));
+        
+        // Update market depth
+        updateMarketDepth(symbol, token, snapQuoteData)
+          .catch(err => logger.error(`Error updating market depth: ${err.message}`));
+          
+        // Update order plans that use this symbol
+        if (subscriptions.has(token)) {
+          const planIds = subscriptions.get(token);
+          for (const planId of planIds) {
+            if (planId) {
+              updateOrderPlanPrice(planId, simpleTick)
+                .catch(err => logger.error(`Async error updating order plan: ${err.message}`));
+            }
+          }
+        }
+      } else {
+        logger.debug(`No symbol mapping found for token ${token} in Snap Quote`);
+      }
+    } catch (error) {
+      logger.error(`Error processing Snap Quote data: ${error.message}`);
+      if (error.stack) {
+        logger.debug(`Stack trace: ${error.stack}`);
+      }
+    }
+  }
+  else {
+    logger.warn(`Unknown binary message type: ${messageType} (0x${messageType.toString(16)})`);
+  }
+}
+
+async function updateMarketDepth(symbol, token, snapQuoteData) {
+  try {
+    const depthKey = `marketdepth:${symbol}`;
+    
+    const depthData = {
+      symbol,
+      token,
+      lastPrice: snapQuoteData.lastTradedPrice,
+      bestFive: snapQuoteData.bestFive,
+      lastUpdateTime: Date.now()
+    };
+    
+    // Store in Redis
+    await redisClient.set(depthKey, JSON.stringify(depthData));
+    logger.debug(`Successfully updated market depth for ${symbol} in Redis`);
+    
+    // Publish update for subscribers
+    await redisPublisher.publish(`marketdepth:update:${symbol}`, JSON.stringify(depthData));
+    logger.debug(`Successfully published market depth update for ${symbol}`);
+    
+  } catch (error) {
+    logger.error(`Error updating market depth for ${symbol}: ${error.message}`);
+  }
+}
+
+function parseSnapQuoteData(buffer) {
+  try {
+    // Log buffer details for debugging
+    logger.debug(`Parsing Snap Quote buffer of length ${buffer.length}`);
+    
+    // Dump the first 40 bytes for analysis
+    const headerBytes = buffer.slice(0, 40).toString('hex');
+    logger.debug(`First 40 bytes of snap quote: ${headerBytes}`);
+    
+    // Extract token as string from position 2
+    let tokenStr = '';
+    for (let i = 2; i < 20; i++) {
+      const byte = buffer[i];
+      if (byte === 0) break;
+      tokenStr += String.fromCharCode(byte);
+    }
+    
+    logger.debug(`Extracted token as string: "${tokenStr}"`);
+    
+    // Try to convert to number if it's numeric
+    const tokenNum = parseInt(tokenStr, 10);
+    const token = isNaN(tokenNum) ? tokenStr : tokenNum;
+    
+    logger.debug(`Final token value: ${token} (${typeof token})`);
+    
+    // Look for the offset where price data begins
+    // First, let's find the first buy entry position
+    const bestFiveStartPosition = 147; // From previous logs
+    
+    // Let's read some data at potential price positions and log them
+    // Try different positions and formats for the prices
+    const possiblePositions = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100];
+    
+    for (const pos of possiblePositions) {
+      if (pos + 8 <= buffer.length) {
+        const valueAsDouble = buffer.readDoubleLE(pos);
+        const valueAsFloat = buffer.readFloatLE(pos);
+        const valueAsInt32 = buffer.readInt32LE(pos);
+        const valueAsInt32Div100 = valueAsInt32 / 100;
+        
+        // Only log if values are reasonable (not extremely small or large)
+        if (Math.abs(valueAsDouble) > 1e-100 && Math.abs(valueAsDouble) < 1e100) {
+          logger.debug(`Position ${pos} as double: ${valueAsDouble}`);
+        }
+        
+        if (Math.abs(valueAsFloat) > 1e-20 && Math.abs(valueAsFloat) < 1e20) {
+          logger.debug(`Position ${pos} as float: ${valueAsFloat}`);
+        }
+        
+        if (Math.abs(valueAsInt32) < 1000000) {
+          logger.debug(`Position ${pos} as int32: ${valueAsInt32}, divided by 100: ${valueAsInt32Div100}`);
+        }
+      }
+    }
+    
+    // Assuming the price fields are stored as 4-byte integers divided by 100
+    // Based on the best five prices which seem reasonable (around 145-150)
+    // Let's try these positions
+    const ltpPos = 35;
+    const openPos = 39;
+    const highPos = 43;
+    const lowPos = 47;
+    const closePos = 51;
+    const volumePos = 55;
+    const totalBuyQuantityPos = 59;
+    const totalSellQuantityPos = 63;
+    
+    // Read prices as integers divided by 100
+    const ltp = buffer.readInt32LE(ltpPos) / 100 || 0;
+    const openPrice = buffer.readInt32LE(openPos) / 100 || 0;
+    const highPrice = buffer.readInt32LE(highPos) / 100 || 0;
+    const lowPrice = buffer.readInt32LE(lowPos) / 100 || 0;
+    const closePrice = buffer.readInt32LE(closePos) / 100 || 0;
+    const volume = buffer.readInt32LE(volumePos) || 0;
+    const totalBuyQuantity = buffer.readInt32LE(totalBuyQuantityPos) || 0;
+    const totalSellQuantity = buffer.readInt32LE(totalSellQuantityPos) || 0;
+    
+    // Log the extracted price data
+    logger.debug(`Extracted prices: LTP=${ltp}, Open=${openPrice}, High=${highPrice}, Low=${lowPrice}, Close=${closePrice}`);
+    logger.debug(`Extracted volume: ${volume}, Buy Qty: ${totalBuyQuantity}, Sell Qty: ${totalSellQuantity}`);
+    
+    // Extract best five data
+    let bestFiveData = null;
+    if (buffer.length >= bestFiveStartPosition + 10*20) {
+        bestFiveData = extractBestFiveData(buffer, bestFiveStartPosition);
+    } else {
+        logger.warn(`Buffer too short for Best Five Data extraction: ${buffer.length}`);
+    }
+    
+    const result = {
+      token: token.toString(),
+      lastTradedPrice: ltp,
+      openPrice,
+      highPrice,
+      lowPrice,
+      closePrice,
+      volumeTradedToday: volume,
+      totalBuyQuantity,
+      totalSellQuantity,
+      bestFive: bestFiveData
+    };
+    
+    return result;
+  } catch (error) {
+    logger.error(`Error parsing Snap Quote data: ${error.message}`);
+    logger.debug(`Buffer length: ${buffer.length}, First 20 bytes: ${buffer.slice(0, 20).toString('hex')}`);
+    throw error;
+  }
+}
 
 /**
  * Check connection health
@@ -494,46 +2392,47 @@ function checkConnectionHealth() {
 }
 
 /**
+ * Clean up message buffers
+ */
+function cleanupMessageBuffers() {
+  try {
+    if (binaryMessageBuffer && expectedMessageLength) {
+      const now = Date.now();
+      const bufferAge = now - lastMessageTime;
+      
+      // If buffer is older than 30 seconds, clean it up
+      if (bufferAge > 30000) {
+        logger.warn(`Cleaning up stale message buffer (age: ${bufferAge}ms)`);
+        
+        // Reset buffer state
+        binaryMessageBuffer = null;
+        expectedMessageLength = null;
+        
+        // Clear timeout
+        if (messageAssemblyTimeout) {
+          clearTimeout(messageAssemblyTimeout);
+          messageAssemblyTimeout = null;
+        }
+      }
+    }
+  } catch (error) {
+    logger.error(`Error cleaning up message buffers: ${error.message}`);
+  }
+}
+
+/**
  * Reconnect WebSocket after failure
  */
 function reconnectWebSocket() {
   try {
     logger.info('Initiating WebSocket reconnection');
     
-    // Close existing connection if any
-    if (ws) {
-      try {
-        ws.terminate();
-      } catch (err) {
-        logger.warn(`Error terminating WebSocket: ${err.message}`);
-      }
-      ws = null;
-    }
+    // Close existing connection
+    closeExistingConnection();
     
     // Update state
     connectionState = ConnectionState.RECONNECTING;
     logger.info('WebSocket connection state:', connectionState);
-    
-    // Clear intervals
-    if (pingInterval) {
-      clearInterval(pingInterval);
-      pingInterval = null;
-    }
-    
-    if (marketDataRequestInterval) {
-      clearInterval(marketDataRequestInterval);
-      marketDataRequestInterval = null;
-    }
-    
-    if (connectionHealthCheckInterval) {
-      clearInterval(connectionHealthCheckInterval);
-      connectionHealthCheckInterval = null;
-    }
-    
-    if (bufferCleanupInterval) {
-      clearInterval(bufferCleanupInterval);
-      bufferCleanupInterval = null;
-    }
     
     // Re-authenticate and reconnect
     authenticate()
@@ -544,117 +2443,15 @@ function reconnectWebSocket() {
       .catch(error => {
         logger.error('WebSocket reconnection failed:', error);
         
-        // Schedule another reconnect attempt
+        // Schedule another reconnect attempt if within limits
         if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          const delay = RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts);
-          logger.info(`Scheduling another reconnect attempt in ${delay}ms`);
-          
-          setTimeout(reconnectWebSocket, delay);
+          handleReconnect();
         } else {
           logger.error('Maximum reconnection attempts reached. Giving up.');
         }
       });
   } catch (error) {
     logger.error('Error in reconnectWebSocket:', error);
-  }
-}
-
-/**
- * Handle WebSocket messages with robust error handling
- * @param {any} data - Message data
- */
-function handleWebSocketMessage(data) {
-  try {
-    // Update last message time
-    lastMessageTime = Date.now();
-    
-    // Handle binary data
-    if (data instanceof Buffer || data instanceof ArrayBuffer) {
-      try {
-        // Get size for logging
-        const size = data instanceof Buffer ? data.length : data.byteLength;
-        logger.debug(`Received WebSocket message: ${data instanceof Buffer ? 'Buffer' : 'ArrayBuffer'}, size: ${size} bytes`);
-        
-        // Handle 51-byte messages directly (the common case from your logs)
-        if (size === 51) {
-          handleAcknowledgmentMessage(data);
-        } else {
-          // Process other binary messages normally
-          processBinaryMessage(data);
-        }
-      } catch (binaryError) {
-        logger.error(`Error processing binary message: ${binaryError.message}`);
-      }
-      return;
-    }
-    
-    // Handle text messages
-    try {
-      const textData = data.toString();
-      logger.debug(`Received text message: ${textData.substring(0, 200)}${textData.length > 200 ? '...' : ''}`);
-      
-      // Try to parse as JSON
-      try {
-        const jsonData = JSON.parse(textData);
-        
-        // Handle authentication response
-        if (jsonData.hasOwnProperty('success')) {
-          if (jsonData.success === true) {
-            logger.info('WebSocket operation successful:', jsonData.message || 'No message');
-            
-            // Check for authentication success
-            if (jsonData.message === "Authenticated") {
-              logger.info('WebSocket authentication successful');
-              
-              // Update connection state
-              connectionState = ConnectionState.AUTHENTICATED;
-              logger.info('WebSocket connection state:', connectionState);
-              
-              // Move to READY state after a short delay
-              setTimeout(() => {
-                connectionState = ConnectionState.READY;
-                logger.info('WebSocket connection state:', connectionState);
-                
-                // Process pending subscriptions
-                processPendingSubscriptions();
-                
-                // Request market data
-                setTimeout(() => {
-                  requestMarketData();
-                }, 1000);
-              }, 1000);
-            }
-          } else {
-            logger.warn(`WebSocket operation failed:`, jsonData.message || 'No error message');
-            
-            // Handle authentication failure
-            if (jsonData.message && jsonData.message.includes("auth")) {
-              logger.error(`Authentication failed: ${jsonData.message}`);
-              
-              // Update connection state
-              connectionState = ConnectionState.DISCONNECTED;
-              logger.info('WebSocket connection state:', connectionState);
-              
-              // Trigger reconnection
-              reconnectWebSocket();
-            }
-          }
-        } 
-        // Handle other JSON message types...
-        else if (jsonData.hasOwnProperty('responses') && Array.isArray(jsonData.responses)) {
-          // Process market data responses
-          handleDataTicks(jsonData.responses);
-        }
-        // Additional message type handling...
-      } catch (jsonError) {
-        // Not valid JSON, log and ignore
-        logger.debug(`Received non-JSON text message: ${textData}`);
-      }
-    } catch (textError) {
-      logger.error(`Error processing text message: ${textError.message}`);
-    }
-  } catch (error) {
-    logger.error('Error handling WebSocket message:', error);
   }
 }
 
@@ -703,6 +2500,7 @@ function processPendingSubscriptions() {
       // Map token to symbol
       if (details.symbol) {
         tokenToSymbolMap.set(token, details.symbol);
+        symbolToTokenMap.set(details.symbol, token);
       }
     }
     
@@ -727,7 +2525,7 @@ function processPendingSubscriptions() {
       correlationID: "subscription_" + Date.now(),
       action: 1, // SUBSCRIBE
       params: {
-        mode: 1, // FULL mode
+        mode: priceMode, // FULL mode
         tokenList
       }
     };
@@ -752,488 +2550,6 @@ function processPendingSubscriptions() {
     logger.error('Error processing pending subscriptions:', error);
   }
 }
-
-/**
- * Add subscription to pending list
- * @param {string} symbol - Trading symbol
- * @param {string} exchange - Exchange name
- * @param {string} token - Token ID
- * @param {string} planId - Plan ID
- */
-function addSubscription(symbol, exchange, token, planId) {
-  try {
-    logger.info(`Adding subscription for ${symbol} (${exchange}, token: ${token})`);
-    
-    // Validate parameters
-    if (!symbol || !exchange || !token) {
-      logger.warn('Invalid subscription parameters:', { symbol, exchange, token });
-      return;
-    }
-    
-    // Create plan ID if not provided
-    const actualPlanId = planId || `${symbol}_${exchange}`;
-    
-    // Add to pending subscriptions
-    pendingSubscriptions.set(token, {
-      symbol,
-      exchange,
-      planId: actualPlanId
-    });
-    
-    // Map token to symbol
-    tokenToSymbolMap.set(token, symbol);
-    
-    // Process immediately if connected
-    if (connectionState === ConnectionState.READY && ws && ws.readyState === WebSocket.OPEN) {
-      processPendingSubscriptions();
-    } else {
-      logger.info(`Queued subscription for ${symbol} (WebSocket state: ${connectionState})`);
-    }
-  } catch (error) {
-    logger.error(`Error adding subscription for ${symbol}:`, error);
-  }
-}
-
-/**
- * Remove subscription
- * @param {string} token - Token ID
- * @param {string} planId - Plan ID (optional)
- */
-function removeSubscription(token, planId) {
-  try {
-    logger.info(`Removing subscription for token ${token}${planId ? ` (plan: ${planId})` : ''}`);
-    
-    // If no specific plan ID, remove all subscriptions for this token
-    if (!planId) {
-      subscriptions.delete(token);
-      tokenToSymbolMap.delete(token);
-      pendingSubscriptions.delete(token);
-      
-      // Unsubscribe from the token
-      unsubscribeToken(token);
-      
-      return;
-    }
-    
-    // Remove specific plan ID from token's subscriptions
-    if (subscriptions.has(token)) {
-      const planIds = subscriptions.get(token);
-      planIds.delete(planId);
-      
-      // If no more subscriptions for this token, unsubscribe
-      if (planIds.size === 0) {
-        subscriptions.delete(token);
-        tokenToSymbolMap.delete(token);
-        
-        // Unsubscribe from the token
-        unsubscribeToken(token);
-      }
-    }
-    
-    // Remove from pending subscriptions if present
-    if (pendingSubscriptions.has(token)) {
-      const details = pendingSubscriptions.get(token);
-      if (!planId || details.planId === planId) {
-        pendingSubscriptions.delete(token);
-      }
-    }
-  } catch (error) {
-    logger.error(`Error removing subscription for token ${token}:`, error);
-  }
-}
-
-/**
- * Unsubscribe from a token
- * @param {string} token - Token ID
- */
-function unsubscribeToken(token) {
-  try {
-    logger.info(`Unsubscribing from token ${token}`);
-    
-    // Check connection state
-    if (connectionState !== ConnectionState.READY || !ws || ws.readyState !== WebSocket.OPEN) {
-      logger.warn(`Cannot unsubscribe: WebSocket not ready (state: ${connectionState})`);
-      return;
-    }
-    
-    // Find symbol and exchange for the token
-    const symbol = tokenToSymbolMap.get(token);
-    if (!symbol) {
-      logger.warn(`Cannot find symbol for token ${token}`);
-      return;
-    }
-    
-    // Get exchange type
-    let exchangeType = 1; // Default to NSE
-    const plan = findOrderPlanBySymbolSync(symbol);
-    if (plan) {
-      exchangeType = mapExchangeToType(plan.exchange);
-    }
-    
-    // Create unsubscription message
-    const unsubscriptionMessage = {
-      correlationID: "unsubscription_" + Date.now(),
-      action: 2, // UNSUBSCRIBE
-      params: {
-        mode: 1, // FULL mode
-        tokenList: [
-          {
-            exchangeType,
-            tokens: [parseInt(token, 10)]
-          }
-        ]
-      }
-    };
-    
-    // Send unsubscription
-    ws.send(JSON.stringify(unsubscriptionMessage));
-    logger.info(`Unsubscribed from token ${token}`);
-  } catch (error) {
-    logger.error(`Error unsubscribing from token ${token}:`, error);
-  }
-}
-
-/**
- * Initialize subscription for NIFTY option (as in your logs)
- */
-function initializeNiftySubscription() {
-  try {
-    // Based on your logs, you're using token 71933 for NIFTY28AUG2524000PE
-    const symbol = 'NIFTY28AUG2524000PE';
-    const exchange = 'NFO';
-    const token = '71933';
-    
-    // Create a cached plan for this symbol
-    cachedPlans.set(symbol, {
-      tradingsymbol: symbol,
-      exchange: exchange,
-      token: token,
-      instrumentType: 'PE', // Put option
-      strikePrice: 24000,
-      expiry: '2025-08-28',
-      underlying: 'NIFTY'
-    });
-    
-    // Add subscription
-    addSubscription(symbol, exchange, token, symbol);
-    
-    logger.info(`Initialized subscription for ${symbol} (token: ${token})`);
-  } catch (error) {
-    logger.error('Error initializing NIFTY subscription:', error);
-  }
-}
-
-
-/**
- * Request market data for all subscribed tokens
- */
-function requestMarketData() {
-  try {
-    if (connectionState !== ConnectionState.READY || !ws || ws.readyState !== WebSocket.OPEN) {
-      logger.warn(`Cannot request market data: WebSocket not ready (state: ${connectionState})`);
-      return;
-    }
-    
-    // Group tokens by exchange
-    const tokensByExchange = new Map(); // exchangeType -> array of tokens
-    
-    // Process all subscriptions
-    for (const [token, planIds] of subscriptions.entries()) {
-      if (planIds.size === 0) continue;
-      
-      // Get symbol for the token
-      const symbol = tokenToSymbolMap.get(token);
-      if (!symbol) {
-        logger.warn(`Cannot find symbol for token ${token}`);
-        continue;
-      }
-      
-      // Get plan for the symbol
-      const plan = findOrderPlanBySymbolSync(symbol);
-      if (!plan) {
-        logger.warn(`Cannot find order plan for symbol ${symbol}`);
-        continue;
-      }
-      
-      // Get exchange type
-      const exchangeType = mapExchangeToType(plan.exchange);
-      
-      // Add to tokens by exchange map
-      if (!tokensByExchange.has(exchangeType)) {
-        tokensByExchange.set(exchangeType, []);
-      }
-      
-      tokensByExchange.get(exchangeType).push(parseInt(token, 10));
-    }
-    
-    // If no tokens to request, return
-    if (tokensByExchange.size === 0) {
-      logger.debug('No tokens to request market data for');
-      return;
-    }
-    
-    // Build token list for request
-    const tokenList = [];
-    for (const [exchangeType, tokens] of tokensByExchange.entries()) {
-      tokenList.push({
-        exchangeType,
-        tokens
-      });
-    }
-    
-    // Create request message
-    const requestMessage = {
-      correlationID: "marketdata_" + Date.now(),
-      action: 2, // MARKET_DATA_REQUEST
-      params: {
-        mode: 1, // FULL mode
-        tokenList
-      }
-    };
-    
-    // Log request summary
-    const tokenCount = tokenList.reduce((sum, item) => sum + item.tokens.length, 0);
-    logger.info(`Requesting market data for ${tokenCount} tokens across ${tokenList.length} exchanges`);
-    
-    // Send request
-    ws.send(JSON.stringify(requestMessage));
-  } catch (error) {
-    logger.error('Error requesting market data:', error);
-  }
-}
-
-/**
- * Find order plan by symbol
- * @param {string} symbol - Trading symbol
- * @returns {Object|null} Order plan or null if not found
- */
-function findOrderPlanBySymbolSync(symbol) {
-  console.log(symbol);
-  try {
-    if (!symbol) return null;
-    
-    // Check cached plans
-    console.log(cachedPlans.values());
-    for (const plan of cachedPlans.values()) {
-      if (plan.tradingsymbol === symbol) {
-        return plan;
-      }
-    }
-    
-    // Plan not found in cache
-    logger.warn(`Cannot find order plan for symbol ${symbol}`);
-    
-    // Create a minimal fallback plan to avoid errors
-    return {
-      tradingsymbol: symbol,
-      exchange: 'NFO', // Default to NFO for option symbols like NIFTY28AUG2524000PE
-      token: symbol.includes('NIFTY') ? '71933' : '0', // Use 71933 for NIFTY options as in your logs
-      instrumentType: symbol.includes('PE') ? 'PE' : (symbol.includes('CE') ? 'CE' : 'OTHER')
-    };
-  } catch (error) {
-    logger.error(`Error finding order plan for symbol ${symbol}:`, error);
-    return null;
-  }
-}
-
-/**
- * Handle 51-byte acknowledgment messages
- * @param {Buffer|ArrayBuffer} data - The message data
- */
-function handleAcknowledgmentMessage(data) {
-  try {
-    // Convert to ArrayBuffer if needed
-    const buffer = data instanceof Buffer ? 
-      data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : 
-      data;
-    
-    // Create views for reading the data
-    const bytes = new Uint8Array(buffer);
-    const dataView = new DataView(buffer);
-    
-    // Log buffer content for debugging
-    let hexDump = '';
-    for (let i = 0; i < bytes.length; i++) {
-      hexDump += bytes[i].toString(16).padStart(2, '0') + ' ';
-      if ((i + 1) % 16 === 0) hexDump += '\n';
-    }
-    logger.debug(`Binary message content:\n${hexDump}`);
-    
-    // Verify message type (byte 2 should be 0x37 = 55)
-    if (bytes[2] !== 0x37) {
-      logger.warn(`Expected message type 0x37, got 0x${bytes[2].toString(16)}`);
-      return;
-    }
-    
-    // Extract message ID (bytes 3-6)
-    let messageId = '';
-    for (let i = 3; i < 7; i++) {
-      if (bytes[i] >= 32 && bytes[i] <= 126) {
-        messageId += String.fromCharCode(bytes[i]);
-      }
-    }
-    
-    // Extract status code (bytes 38-39, observed from your data)
-    let statusCode = 0;
-    if (buffer.byteLength >= 40) {
-      statusCode = dataView.getUint16(38, true);
-    }
-    
-    logger.debug(`Acknowledgment message: ID=${messageId}, status=${statusCode} (0x${statusCode.toString(16)})`);
-    
-    // Handle status code
-    if (statusCode !== 0) {
-      switch (statusCode) {
-        case 307:
-          logger.info('Received status code 307 (temporary redirect), refreshing subscriptions');
-          // Schedule resubscription
-          setTimeout(() => {
-            resubscribeAll();
-          }, 2000);
-          break;
-          
-        case 4650: // 0x122A (observed in your logs)
-          logger.debug(`Received status code 4650 (0x122A), possibly a heartbeat`);
-          break;
-          
-        default:
-          logger.debug(`Received status code ${statusCode} (0x${statusCode.toString(16)})`);
-          break;
-      }
-    }
-    
-    // If message ID matches a token we're interested in, log it
-    if (messageId === "1933") {
-      logger.debug(`Received acknowledgment for token 71933`);
-    }
-  } catch (error) {
-    logger.error(`Error handling acknowledgment message: ${error.message}`);
-  }
-}
-
-
-/**
- * Handle the special 51-byte acknowledgment messages
- * @param {ArrayBuffer} buffer - 51-byte binary buffer
- */
-function handleSpecial51ByteMessage(buffer) {
-  try {
-    // Validate buffer size
-    if (buffer.byteLength !== 51) {
-      logger.warn(`Expected 51-byte buffer, got ${buffer.byteLength} bytes`);
-      return;
-    }
-    
-    const bytes = new Uint8Array(buffer);
-    const dataView = new DataView(buffer);
-    
-    // Validate message type (byte 2 should be 0x37 = 55)
-    if (bytes[2] !== 0x37) {
-      logger.warn(`Expected message type 0x37, got 0x${bytes[2].toString(16)}`);
-      return;
-    }
-    
-    // Extract fields from the message
-    
-    // Bytes 0-1: Message length (usually 0x01 0x02 = 513 in little-endian)
-    const messageLength = dataView.getUint16(0, true);
-    
-    // Byte 2: Message type (0x37 = 55)
-    const messageType = bytes[2];
-    
-    // Bytes 3-6: Message ID or token (ASCII "1933" = 0x31 0x39 0x33 0x33)
-    let messageIdStr = '';
-    for (let i = 3; i < 7; i++) {
-      if (bytes[i] >= 32 && bytes[i] <= 126) {
-        messageIdStr += String.fromCharCode(bytes[i]);
-      }
-    }
-    
-    // Extract status code (position varies, but appears to be around bytes 38-39)
-    // Try a few known positions based on the observed data
-    let statusCode = 0;
-    if (buffer.byteLength >= 40) {
-      // Try position 38 (0-based index)
-      statusCode = dataView.getUint16(38, true);
-    }
-    
-    logger.debug(`Processed 51-byte acknowledgment: ID=${messageIdStr}, status=${statusCode}`);
-    
-    // Handle specific status codes
-    if (statusCode !== 0) {
-      handleSpecialStatusCodes(statusCode);
-    }
-    
-    // Match the message ID to a token if possible
-    if (/^\d+$/.test(messageIdStr)) {
-      const numericId = parseInt(messageIdStr, 10);
-      if (numericId === 71933) { // This matches the token in your logs
-        logger.debug(`Acknowledgment for token 71933 (NIFTY28AUG2524000PE)`);
-      }
-    }
-  } catch (error) {
-    logger.error(`Error handling 51-byte message: ${error.message}`);
-    if (error.stack) logger.debug(`Stack trace: ${error.stack}`);
-  }
-}
-
-
-/**
- * Process general binary message
- * @param {Buffer|ArrayBuffer} data - The message data
- */
-function processBinaryMessage(data) {
-  try {
-    // Convert to ArrayBuffer if needed
-    const buffer = data instanceof Buffer ? 
-      data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : 
-      data;
-    
-    // Create views for reading the data
-    const bytes = new Uint8Array(buffer);
-    const dataView = new DataView(buffer);
-    
-    // Check for minimum size
-    if (buffer.byteLength < 3) {
-      logger.warn(`Binary message too small: ${buffer.byteLength} bytes`);
-      return;
-    }
-    
-    // Read message length (first 2 bytes, little endian)
-    const messageLength = dataView.getUint16(0, true);
-    
-    // Read message type (byte 2)
-    const messageType = bytes[2];
-    
-    logger.debug(`Binary message: length=${messageLength}, type=${messageType} (0x${messageType.toString(16)})`);
-    
-    // Handle different message types
-    switch (messageType) {
-      case 1: // Market data
-        parseMarketData(buffer);
-        break;
-        
-      case 2: // Index data
-        parseIndexData(buffer);
-        break;
-        
-      case 55: // Acknowledgment (should be handled by handleAcknowledgmentMessage)
-        logger.debug(`Processing type 55 message with length ${buffer.byteLength}`);
-        // For larger type 55 messages, we may have additional data
-        if (buffer.byteLength > 51) {
-          // Process as needed
-        }
-        break;
-        
-      default:
-        logger.warn(`Unknown binary message type: ${messageType} (0x${messageType.toString(16)})`);
-        break;
-    }
-  } catch (error) {
-    logger.error(`Error processing binary message: ${error.message}`);
-  }
-}
-
 
 /**
  * Parse market data message
@@ -1330,8 +2646,6 @@ function parseMarketData(buffer) {
         lastTradedQuantity,
         averageTradedPrice
       });
-      
-      logger.debug(`Parsed market data for token ${token}: LTP=${lastTradedPrice}`);
     }
     
     // Process the ticks
@@ -1414,8 +2728,6 @@ function parseIndexData(buffer) {
         exchangeTimestamp: timestamp,
         isIndex: true
       });
-      
-      logger.debug(`Parsed index data for token ${token}: Value=${indexValue}`);
     }
     
     // Process the ticks
@@ -1428,591 +2740,411 @@ function parseIndexData(buffer) {
 }
 
 /**
- * Parse a type 55 message, even if incomplete
- * @param {ArrayBuffer} buffer - Binary buffer
- * @returns {Object} Parsed message data
+ * Handle data ticks
+ * @param {ArrayBuffer|Buffer} buffer - Binary data received from WebSocket
+ * @returns {Object|null} Decoded market data object or null if error
  */
-function parseType55Message(buffer) {
+function handleDataTicks(buffer) {
   try {
-    // Create result object
-    const result = {
-      responseType: 55,
-      timestamp: new Date().toISOString(),
-      messageType: 'acknowledgment',
-      ticks: []
-    };
+    // Ensure we have a proper ArrayBuffer to work with
+    const arrayBuffer = buffer instanceof Buffer ? 
+      buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) : 
+      buffer;
     
-    const bytes = new Uint8Array(buffer);
+    const dataView = new DataView(arrayBuffer);
+    const bytes = new Uint8Array(arrayBuffer);
     
-    // Message should have at least 7 bytes for basic parsing
-    if (buffer.byteLength < 7) {
-      result.messageType = 'incomplete_acknowledgment';
-      return result;
-    }
+    // Extract basic header information
+    const mode = bytes[0]; // Subscription mode (1=LTP, 2=Quote, 3=Snap Quote)
+    const exchangeType = bytes[1]; // Exchange type code
     
-    // Extract message ID from bytes 3-6
-    let messageIdStr = '';
-    for (let i = 3; i < 7; i++) {
-      if (bytes[i] >= 32 && bytes[i] <= 126) {
-        messageIdStr += String.fromCharCode(bytes[i]);
+    // Log the raw data for debugging
+    logger.debug(`Decoding market data: mode=${mode}, exchangeType=${exchangeType}, message size=${arrayBuffer.byteLength}`);
+    
+    // Extract token (string terminated by null byte)
+    let token = '';
+    for (let i = 2; i < 27; i++) {
+      if (bytes[i] === 0) {
+        break;
       }
+      token += String.fromCharCode(bytes[i]);
     }
     
-    result.messageIdRaw = messageIdStr;
-    
-    // Try to parse as number if it looks like digits
-    if (/^\d+$/.test(messageIdStr)) {
-      result.messageId = parseInt(messageIdStr, 10);
-    } else {
-      result.messageId = 0; // Default if not parseable
-    }
-    
-    // If we have a status code at the end (51-byte fragment typically has this at the end)
-    if (buffer.byteLength >= 30) {
-      // The status code seems to be around offset 26-28
-      try {
-        const dataView = new DataView(buffer);
-        const statusPos = buffer.byteLength - 4; // Typically 4 bytes from the end
-        if (statusPos > 0 && statusPos < buffer.byteLength - 1) {
-          result.statusCode = dataView.getUint16(statusPos, true);
-        } else {
-          result.statusCode = 0;
-        }
-      } catch (err) {
-        logger.warn(`Error extracting status code: ${err.message}`);
-        result.statusCode = 0;
-      }
-    } else {
-      result.statusCode = 0;
-    }
-    
-    return result;
-  } catch (error) {
-    logger.error(`Error parsing type 55 message: ${error.message}`);
-    return {
-      responseType: 55,
-      timestamp: new Date().toISOString(),
-      messageType: 'error_acknowledgment',
-      error: error.message,
-      ticks: []
-    };
-  }
-}
-
-/**
- * Handle parsed binary message
- * @param {Object} parsedData - Parsed message data
- */
-function handleParsedMessage(parsedData) {
-  try {
-    if (!parsedData) {
-      logger.warn('Received null parsed data');
-      return;
-    }
-    
-    switch (parsedData.responseType) {
-      case 1: // Market data
-      case 2: // Index data
-        if (parsedData.ticks && parsedData.ticks.length > 0) {
-          handleDataTicks(parsedData.ticks);
-        } else {
-          logger.debug(`Received ${parsedData.responseType === 1 ? 'market' : 'index'} data message with no ticks`);
-        }
-        break;
-        
-      case 55: // Acknowledgment/heartbeat
-        logger.debug(`Processed type 55 message (${parsedData.messageType}): ID=${parsedData.messageId}, status=${parsedData.statusCode}`);
-        
-        // Check status code
-        if (parsedData.statusCode !== 0) {
-          // Handle special status codes
-          handleSpecialStatusCodes(parsedData.statusCode);
-        }
-        break;
-        
-      default:
-        logger.debug(`Processed message with unknown type ${parsedData.responseType}`);
-        break;
-    }
-  } catch (error) {
-    logger.error('Error handling parsed message:', error);
-  }
-}
-
-/**
- * Get the filled length of the binary message buffer
- * @returns {number} Filled length
- */
-function getFilledBufferLength() {
-  if (!binaryMessageBuffer || !expectedMessageLength) {
-    return 0;
-  }
-  
-  try {
-    // First, check for a non-standard case: if the buffer length is exactly 51 bytes
-    // and it's a type 55 message, this might be a special case
-    if (binaryMessageBuffer.length >= 3 && binaryMessageBuffer[2] === 0x37) {
-      // Count non-zero bytes
-      let nonZeroCount = 0;
-      for (let i = 0; i < binaryMessageBuffer.length; i++) {
-        if (binaryMessageBuffer[i] !== 0) {
-          nonZeroCount++;
-        }
-      }
-      
-      // If we have around 51 non-zero bytes, this is likely the special case
-      if (nonZeroCount > 45 && nonZeroCount < 55) {
-        return nonZeroCount;
-      }
-    }
-    
-    // Standard case: find the last non-zero byte
-    for (let i = binaryMessageBuffer.length - 1; i >= 0; i--) {
-      if (binaryMessageBuffer[i] !== 0) {
-        return i + 1;
-      }
-    }
-    
-    // If all bytes are zero, return 0
-    return 0;
-  } catch (error) {
-    logger.error(`Error in getFilledBufferLength: ${error.message}`);
-    return 0;
-  }
-}
-
-/**
- * Handle special status codes from WebSocket messages
- * @param {number} statusCode - Status code from the message
- */
-function handleSpecialStatusCodes(statusCode) {
-  try {
-    logger.debug(`Handling status code: ${statusCode}`);
-    
-    switch (statusCode) {
-      case 0:
-        // Success, nothing to do
-        break;
-        
-      case 307:
-        logger.info('Received status code 307 (temporary redirect), refreshing subscriptions');
-        
-        // Wait a short time before resubscribing
-        setTimeout(() => {
-          resubscribeAll();
-        }, 2000);
-        break;
-        
-      case 401:
-      case 403:
-        logger.warn(`Received authentication error (${statusCode}), reconnecting...`);
-        reconnectWebSocket();
-        break;
-        
-      case 429:
-        logger.warn('Received status code 429 (too many requests), backing off');
-        // Implement backoff logic
-        break;
-        
-      case 4369: // 0x1111 (observed in your logs)
-        logger.debug('Received status code 4369 (0x1111), possibly a success code');
-        break;
-        
-      default:
-        logger.warn(`Received unknown status code: ${statusCode} (0x${statusCode.toString(16)})`);
-        break;
-    }
-  } catch (error) {
-    logger.error(`Error handling status code ${statusCode}: ${error.message}`);
-  }
-}
-
-/**
- * Clean up message buffers
- */
-function cleanupMessageBuffers() {
-  try {
-    if (binaryMessageBuffer && expectedMessageLength) {
-      const now = Date.now();
-      const bufferAge = now - lastMessageTime;
-      
-      // If buffer is older than 30 seconds, clean it up
-      if (bufferAge > 30000) {
-        logger.warn(`Cleaning up stale message buffer (age: ${bufferAge}ms)`);
-        
-        // Reset buffer state
-        binaryMessageBuffer = null;
-        expectedMessageLength = null;
-        
-        // Clear timeout
-        if (messageAssemblyTimeout) {
-          clearTimeout(messageAssemblyTimeout);
-          messageAssemblyTimeout = null;
-        }
-      }
-    }
-  } catch (error) {
-    logger.error(`Error cleaning up message buffers: ${error.message}`);
-  }
-}
-
-
-// Add a cleanup interval
-let bufferCleanupInterval = setInterval(cleanupMessageBuffers, 10000); // Every 10 seconds
-
-// Add a backoff multiplier for requests
-let requestBackoffMultiplier = 1;
-
-/**
- * Parse binary message from WebSocket
- * @param {ArrayBuffer} buffer - Binary data buffer
- * @returns {Object|null} Parsed data or null on error
- */
-function parseBinaryMessage(buffer) {
-  try {
-    // Create a DataView for reading the buffer with Little Endian
-    const dataView = new DataView(buffer);
-    
-    // Get the message length (first 2 bytes)
-    const messageLength = dataView.getUint16(0, true); // true for Little Endian
-    
-    // Calculate expected buffer size
-    const expectedSize = 2 + messageLength;
-    if (buffer.byteLength < expectedSize) {
-      logger.warn(`Incomplete message: expected ${expectedSize} bytes, got ${buffer.byteLength}`);
+    // Safety check on token
+    if (!token) {
+      logger.warn(`Received market data with empty token, skipping`);
       return null;
     }
     
-    // Parse the response type (1 byte)
-    const responseType = dataView.getUint8(2);
+    // Extract sequence number (8 bytes, little-endian)
+    const sequenceNumber = Number(dataView.getBigUint64(27, true));
     
-    // Log the response type for debugging
-    logger.debug(`Binary message response type: ${responseType} (0x${responseType.toString(16)})`);
+    // Extract exchange timestamp (8 bytes, little-endian)
+    const exchangeTimestamp = Number(dataView.getBigUint64(35, true));
     
-    // Dump the first 32 bytes of the message for debugging
-    const bytes = new Uint8Array(buffer);
-    let headerHex = '';
-    let headerAscii = '';
-    for (let i = 0; i < Math.min(buffer.byteLength, 32); i++) {
-      const byte = bytes[i];
-      headerHex += byte.toString(16).padStart(2, '0') + ' ';
-      headerAscii += (byte >= 32 && byte <= 126) ? String.fromCharCode(byte) : '.';
-    }
-    logger.debug(`Binary message header (hex): ${headerHex}`);
-    logger.debug(`Binary message header (ascii): ${headerAscii}`);
+    // Get exchange name safely
+    let exchangeName = getExchangeName(exchangeType);
     
-    // Initialize result object
-    const result = {
-      responseType,
-      timestamp: new Date().toISOString(),
-      ticks: []
+    // Create base response object with common fields
+    const response = {
+      mode,
+      exchangeTypeCode: exchangeType,
+      exchangeType: exchangeName,
+      token,
+      sequenceNumber,
+      exchangeTimestamp: new Date(exchangeTimestamp).toISOString(),
+      rawExchangeTimestamp: exchangeTimestamp
     };
     
-    // Current position in the buffer
-    let position = 3;
-    
-    // Parse based on response type
-    switch (responseType) {
-      case 1: // Market data
-        // Parse exchange type (1 byte)
-        const exchangeType = dataView.getUint8(position);
-        position += 1;
-        
-        // Parse number of tokens (2 bytes)
-        const tokenCount = dataView.getUint16(position, true);
-        position += 2;
-        
-        logger.debug(`Parsing market data: exchange type ${exchangeType}, token count ${tokenCount}`);
-        
-        // Parse each token data
-        for (let i = 0; i < tokenCount; i++) {
-          // Parse token (4 bytes for integer token)
-          const token = dataView.getUint32(position, true).toString();
-          position += 4;
-          
-          // Parse sequence number (4 bytes)
-          const sequenceNumber = dataView.getUint32(position, true);
-          position += 4;
-          
-          // Parse exchange timestamp (8 bytes)
-          const exchangeTimestampLow = dataView.getUint32(position, true);
-          position += 4;
-          const exchangeTimestampHigh = dataView.getUint32(position, true);
-          position += 4;
-          const exchangeTimestamp = (BigInt(exchangeTimestampHigh) << BigInt(32) | BigInt(exchangeTimestampLow)).toString();
-          
-          // Parse last traded price (8 bytes as double)
-          const lastTradedPrice = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse last traded quantity (8 bytes)
-          const lastTradedQuantity = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse average traded price (8 bytes)
-          const averageTradedPrice = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse volume (8 bytes)
-          const volume = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse total buy quantity (8 bytes)
-          const totalBuyQuantity = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse total sell quantity (8 bytes)
-          const totalSellQuantity = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse open price (8 bytes)
-          const openPrice = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse high price (8 bytes)
-          const highPrice = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse low price (8 bytes)
-          const lowPrice = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse close price (8 bytes)
-          const closePrice = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Add to ticks array, matching the format expected by handleDataTicks
-          result.ticks.push({
-            token,
-            ltp: lastTradedPrice,
-            open: openPrice,
-            high: highPrice,
-            low: lowPrice,
-            close: closePrice,
-            totalTradedQty: volume,
-            totBuyQty: totalBuyQuantity,
-            totSellQty: totalSellQuantity,
-            sequenceNumber,
-            exchangeTimestamp,
-            lastTradedQuantity,
-            averageTradedPrice
-          });
-          
-          logger.debug(`Parsed token ${token}: LTP=${lastTradedPrice}`);
-        }
-        break;
-        
-      case 2: // Index data
-        // Parse exchange type (1 byte)
-        const indexExchangeType = dataView.getUint8(position);
-        position += 1;
-        
-        // Parse number of indices (2 bytes)
-        const indexCount = dataView.getUint16(position, true);
-        position += 2;
-        
-        logger.debug(`Parsing index data: exchange type ${indexExchangeType}, index count ${indexCount}`);
-        
-        // Parse each index data
-        for (let i = 0; i < indexCount; i++) {
-          // Parse index token (4 bytes)
-          const indexToken = dataView.getUint32(position, true).toString();
-          position += 4;
-          
-          // Parse sequence number (4 bytes)
-          const indexSequenceNumber = dataView.getUint32(position, true);
-          position += 4;
-          
-          // Parse index timestamp (8 bytes)
-          const indexTimestampLow = dataView.getUint32(position, true);
-          position += 4;
-          const indexTimestampHigh = dataView.getUint32(position, true);
-          position += 4;
-          const indexTimestamp = (BigInt(indexTimestampHigh) << BigInt(32) | BigInt(indexTimestampLow)).toString();
-          
-          // Parse index value (8 bytes as double)
-          const indexValue = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse open value (8 bytes)
-          const indexOpenValue = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse high value (8 bytes)
-          const indexHighValue = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse low value (8 bytes)
-          const indexLowValue = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Parse close value (8 bytes)
-          const indexCloseValue = dataView.getFloat64(position, true);
-          position += 8;
-          
-          // Add to ticks array, matching the format expected by handleDataTicks
-          result.ticks.push({
-            token: indexToken,
-            ltp: indexValue, // Index value
-            open: indexOpenValue,
-            high: indexHighValue,
-            low: indexLowValue,
-            close: indexCloseValue,
-            sequenceNumber: indexSequenceNumber,
-            exchangeTimestamp: indexTimestamp,
-            isIndex: true
-          });
-          
-          logger.debug(`Parsed index ${indexToken}: Value=${indexValue}`);
-        }
-        break;
-        
-      case 55: // This appears to be a heartbeat or acknowledgment message (0x37 in hex)
-        logger.debug('Received message with response type 55 (likely a heartbeat or acknowledgment)');
-        
-        // Based on the observed data structure from the logs, we need to parse differently
-        // The message appears to contain multiple repeating patterns of "71933"
-        
-        try {
-          // Extract a 4-byte message ID at position 3-6
-          if (position + 4 <= buffer.byteLength) {
-            const messageIdBytes = new Uint8Array(buffer, position, 4);
-            let messageIdStr = '';
-            for (let i = 0; i < 4; i++) {
-              const byte = messageIdBytes[i];
-              if (byte >= 32 && byte <= 126) {
-                messageIdStr += String.fromCharCode(byte);
-              }
-            }
-            position += 4;
-            
-            result.messageIdRaw = messageIdStr;
-            
-            // Try to parse as number if it looks like digits
-            if (/^\d+$/.test(messageIdStr)) {
-              result.messageId = parseInt(messageIdStr, 10);
-            } else {
-              result.messageId = 0; // Default if not parseable
-            }
-            
-            logger.debug(`Message ID/Sequence: ${result.messageId}`);
-          }
-          
-          // Find status code near the end of the message
-          // The status code appears to be a 2-byte value near the end of the message
-          if (buffer.byteLength >= 6) {
-            // Try to find the status code at the expected position (near the end)
-            const statusPosition = buffer.byteLength - 4;
-            if (statusPosition > 0 && statusPosition < buffer.byteLength) {
-              const statusCode = dataView.getUint16(statusPosition, true);
-              result.statusCode = statusCode;
-              logger.debug(`Status code: ${statusCode}`);
-            } else {
-              result.statusCode = 0; // Default if can't find
-            }
-          }
-          
-          return result;
-        } catch (error) {
-          logger.warn(`Error parsing type 55 message: ${error.message}`);
-          
-          // Return a minimal result since there are no ticks
-          return {
-            responseType: 55,
-            timestamp: new Date().toISOString(),
-            messageType: 'heartbeat',
-            error: error.message,
-            ticks: []
-          };
-        }
-        
-      default:
-        // Don't treat unknown response types as errors, just log them
-        logger.warn(`Unknown response type: ${responseType} (0x${responseType.toString(16)})`);
-        
-        // Dump the entire buffer for unknown message types
-        const fullBytes = new Uint8Array(buffer);
-        let fullHex = '';
-        let fullAscii = '';
-        for (let i = 0; i < fullBytes.length; i++) {
-          const byte = fullBytes[i];
-          fullHex += byte.toString(16).padStart(2, '0') + ' ';
-          fullAscii += (byte >= 32 && byte <= 126) ? String.fromCharCode(byte) : '.';
-          
-          // Add line breaks every 16 bytes for readability
-          if ((i + 1) % 16 === 0) {
-            fullHex += '\n';
-            fullAscii += '\n';
-          }
-        }
-        logger.debug(`Full message dump (hex):\n${fullHex}`);
-        logger.debug(`Full message dump (ascii):\n${fullAscii}`);
-        
-        // Return a minimal result with the unknown type
-        return {
-          responseType,
-          timestamp: new Date().toISOString(),
-          messageType: 'unknown',
-          ticks: []
-        };
+    // Get the trading symbol if available
+    const symbol = tokenToSymbolMap.get(token);
+    if (symbol) {
+      response.tradingSymbol = symbol;
     }
     
-    return result;
+    // Create a tick data object for compatibility with existing code
+    const tickData = {
+      token,
+      sequenceNumber,
+      exchangeTimestamp: response.exchangeTimestamp
+    };
+    
+    // Extract mode-specific data
+    if (mode >= 1) { // LTP mode and higher
+      try {
+        // LTP is in position 43 (4 bytes, little-endian)
+        const ltpRaw = dataView.getInt32(43, true);
+        
+        // Apply price conversion based on exchange type
+        response.lastTradedPrice = convertPrice(ltpRaw, exchangeType);
+        tickData.ltp = response.lastTradedPrice;
+        
+        if (mode === 1) {
+          // For LTP mode, we're done here (packet size = 51 bytes)
+          logger.debug(`Decoded LTP data for ${symbol || token}: ${response.lastTradedPrice}`);
+          
+          // Process the tick data
+          processTickData(token, symbol, tickData);
+          
+          return response;
+        }
+      } catch (ltp_error) {
+        logger.error(`Error extracting LTP data: ${ltp_error.message}`);
+        response.error = `Failed to extract LTP: ${ltp_error.message}`;
+        return response;
+      }
+    }
+    
+    if (mode >= 2) { // Quote mode and higher
+      try {
+        // Last traded quantity - position 51, 8 bytes
+        response.lastTradedQuantity = Number(dataView.getBigUint64(51, true));
+        tickData.lastTradedQuantity = response.lastTradedQuantity;
+        
+        // Average traded price - position 59, 8 bytes
+        response.averageTradedPrice = convertPrice(Number(dataView.getBigUint64(59, true)), exchangeType);
+        tickData.averageTradedPrice = response.averageTradedPrice;
+        
+        // Volume traded for the day - position 67, 8 bytes
+        response.volumeTradedToday = Number(dataView.getBigUint64(67, true));
+        tickData.totalTradedQty = response.volumeTradedToday;
+        tickData.volume = response.volumeTradedToday;
+        
+        // Total buy quantity - position 75, 8 bytes (double)
+        response.totalBuyQuantity = dataView.getFloat64(75, true);
+        tickData.totBuyQty = response.totalBuyQuantity;
+        
+        // Total sell quantity - position 83, 8 bytes (double)
+        response.totalSellQuantity = dataView.getFloat64(83, true);
+        tickData.totSellQty = response.totalSellQuantity;
+        
+        // Open price - position 91, 8 bytes
+        response.openPrice = convertPrice(Number(dataView.getBigUint64(91, true)), exchangeType);
+        tickData.open = response.openPrice;
+        
+        // High price - position 99, 8 bytes
+        response.highPrice = convertPrice(Number(dataView.getBigUint64(99, true)), exchangeType);
+        tickData.high = response.highPrice;
+        
+        // Low price - position 107, 8 bytes
+        response.lowPrice = convertPrice(Number(dataView.getBigUint64(107, true)), exchangeType);
+        tickData.low = response.lowPrice;
+        
+        // Close price - position 115, 8 bytes
+        response.closePrice = convertPrice(Number(dataView.getBigUint64(115, true)), exchangeType);
+        tickData.close = response.closePrice;
+        
+        if (mode === 2) {
+          // For Quote mode, we're done here (packet size = 123 bytes)
+          logger.debug(`Decoded Quote data for ${symbol || token}`);
+          
+          // Process the tick data
+          processTickData(token, symbol, tickData);
+          
+          return response;
+        }
+      } catch (quote_error) {
+        logger.error(`Error extracting Quote data: ${quote_error.message}`);
+        response.error = `Failed to extract Quote data: ${quote_error.message}`;
+        
+        // Process the partial tick data we have so far
+        processTickData(token, symbol, tickData);
+        
+        return response;
+      }
+    }
+    
+    if (mode === 3) { // Snap Quote mode
+      try {
+        // Last traded timestamp - position 123, 8 bytes
+        response.lastTradedTimestamp = Number(dataView.getBigUint64(123, true));
+        response.lastTradedTime = new Date(response.lastTradedTimestamp).toISOString();
+        
+        // Open Interest - position 131, 8 bytes
+        response.openInterest = Number(dataView.getBigUint64(131, true));
+        tickData.openInterest = response.openInterest;
+        
+        // Open Interest change % - position 139, 8 bytes (double)
+        response.openInterestChangePercent = dataView.getFloat64(139, true);
+        tickData.openInterestChangePercent = response.openInterestChangePercent;
+        
+        // Best Five Data - position 147, 200 bytes (10 packets × 20 bytes)
+        response.bestFiveData = extractBestFiveData(arrayBuffer, 147, exchangeType);
+        
+        // Upper circuit limit - position 347, 8 bytes
+        response.upperCircuitLimit = convertPrice(Number(dataView.getBigUint64(347, true)), exchangeType);
+        tickData.upperCircuitLimit = response.upperCircuitLimit;
+        
+        // Lower circuit limit - position 355, 8 bytes
+        response.lowerCircuitLimit = convertPrice(Number(dataView.getBigUint64(355, true)), exchangeType);
+        tickData.lowerCircuitLimit = response.lowerCircuitLimit;
+        
+        // 52 week high price - position 363, 8 bytes
+        response.fiftyTwoWeekHighPrice = convertPrice(Number(dataView.getBigUint64(363, true)), exchangeType);
+        tickData.fiftyTwoWeekHighPrice = response.fiftyTwoWeekHighPrice;
+        
+        // 52 week low price - position 371, 8 bytes
+        response.fiftyTwoWeekLowPrice = convertPrice(Number(dataView.getBigUint64(371, true)), exchangeType);
+        tickData.fiftyTwoWeekLowPrice = response.fiftyTwoWeekLowPrice;
+        
+        logger.debug(`Decoded Snap Quote data for ${symbol || token}`);
+        
+        // Process the tick data
+        processTickData(token, symbol, tickData);
+        
+        return response;
+      } catch (snap_quote_error) {
+        logger.error(`Error extracting Snap Quote data: ${snap_quote_error.message}`);
+        response.error = `Failed to extract Snap Quote data: ${snap_quote_error.message}`;
+        
+        // Process the partial tick data we have so far
+        processTickData(token, symbol, tickData);
+        
+        return response;
+      }
+    }
+    
+    // Process the tick data for the mode we have
+    processTickData(token, symbol, tickData);
+    
+    return response;
   } catch (error) {
-    logger.error('Error parsing binary message:', error);
-    
-    // Log buffer content for debugging
-    const bytes = new Uint8Array(buffer);
-    let bufferStr = '';
-    for (let i = 0; i < Math.min(buffer.byteLength, 100); i++) {
-      bufferStr += bytes[i].toString(16).padStart(2, '0') + ' ';
-    }
-    logger.debug(`Buffer content (first 100 bytes): ${bufferStr}`);
-    
-    return null;
+    logger.error(`Error handling data tick: ${error.message}`);
+    console.error('Error details:', error.stack);
+    return {
+      error: 'Failed to parse market data',
+      errorDetails: error.message
+    };
   }
 }
 
 /**
- * Handle data ticks
- * @param {Array} ticks - Array of tick data
+ * Process tick data and update related systems
+ * @param {string} token - Security token
+ * @param {string|undefined} symbol - Trading symbol
+ * @param {Object} tickData - Tick data
  */
-function handleDataTicks(ticks) {
+function processTickData(token, symbol, tickData) {
   try {
-    if (!ticks || !Array.isArray(ticks)) {
-      logger.warn('Invalid ticks data:', ticks);
-      return;
+    // Store last tick data
+    if (token) {
+      lastTicks.set(token, tickData);
     }
     
-    logger.debug(`Processing ${ticks.length} data ticks`);
-    
-    // Process each tick
-    for (const tick of ticks) {
-      try {
-        const token = tick.token ? tick.token.toString() : null;
-        
-        if (!token) {
-          logger.warn('Tick missing token:', tick);
-          continue;
+    // Update symbol price in Redis and order plans
+    if (symbol) {
+      updateSymbolPrice(symbol, token, tickData);
+      
+      // Update order plans that use this symbol
+      if (subscriptions.has(token)) {
+        const planIds = subscriptions.get(token);
+        for (const planId of planIds) {
+          updateOrderPlanPrice(planId, tickData);
         }
-        
-        // Get symbol for the token
-        const symbol = tokenToSymbolMap.get(token);
-        
-        // Log tick data
-        logger.debug(`Tick for ${symbol || token}: LTP=${tick.ltp}, open=${tick.open}, high=${tick.high}, low=${tick.low}, close=${tick.close}`);
-        
-        // Add processing logic here
-        // ...
-        
-      } catch (tickError) {
-        logger.error('Error processing tick:', tickError);
       }
+      
+      // Log a summary of the price update
+      const priceChange = tickData.close > 0 ? 
+        ((tickData.ltp - tickData.close) / tickData.close * 100).toFixed(2) + '%' : 
+        'N/A';
+      
+      logger.info(`Market data for ${symbol}: LTP=${tickData.ltp}, Change=${priceChange}`);
     }
   } catch (error) {
-    logger.error('Error handling data ticks:', error);
+    logger.error(`Error processing tick data: ${error.message}`);
   }
 }
+
+/**
+ * Extract best five buy/sell data from buffer
+ * @param {ArrayBuffer} buffer - The binary data
+ * @param {number} startOffset - Starting position in buffer
+ * @param {number} exchangeType - Exchange type code
+ * @returns {Object} Best five buy and sell data
+ */
+function extractBestFiveData(buffer, startPosition) {
+  try {
+    // Extract best five data (10 entries, 5 buy and 5 sell)
+    const bestFive = {
+      buy: [],
+      sell: []
+    };
+    
+    // The size of each entry is 20 bytes:
+    // 2 (buy/sell flag) + 8 (quantity) + 8 (price) + 2 (number of orders)
+    const entrySize = 20;
+    
+    // Dump raw bytes for the first buy and sell entries for analysis
+    const firstBuyEntry = buffer.slice(startPosition, startPosition + entrySize);
+    const firstSellEntry = buffer.slice(startPosition + (5 * entrySize), startPosition + (6 * entrySize));
+    
+    logger.debug(`First buy entry raw bytes: ${firstBuyEntry.toString('hex')}`);
+    logger.debug(`First sell entry raw bytes: ${firstSellEntry.toString('hex')}`);
+    
+    // Process buy orders (first 5 entries)
+    for (let i = 0; i < 5; i++) {
+      const pos = startPosition + (i * entrySize);
+      
+      if (pos + entrySize > buffer.length) {
+        logger.warn(`Buffer too short for order ${i+1}`);
+        break;
+      }
+      
+      // Read according to the specification
+      const buyFlag = buffer.readInt16LE(pos);
+      const quantity = Number(buffer.readBigInt64LE(pos + 2));
+      const rawPrice = Number(buffer.readBigInt64LE(pos + 10));
+      const price = rawPrice / 100; // Price is divided by 100 as per docs
+      const orders = buffer.readInt16LE(pos + 18);
+      
+      // Skip entries with wrong buy/sell flag
+      if (buyFlag !== 1 && buyFlag !== 0) {
+        logger.warn(`Invalid buy/sell flag ${buyFlag} at position ${pos}`);
+        continue;
+      }
+      
+      // Add only buy orders to the buy array
+      if (buyFlag === 1) {
+        bestFive.buy.push({
+          quantity,
+          price: parseFloat(price.toFixed(2)),
+          orders
+        });
+      } else if (buyFlag === 0) {
+        bestFive.sell.push({
+          quantity,
+          price: parseFloat(price.toFixed(2)),
+          orders
+        });
+      }
+    }
+    
+    // Process next 5 entries (could be either buy or sell)
+    for (let i = 5; i < 10; i++) {
+      const pos = startPosition + (i * entrySize);
+      
+      if (pos + entrySize > buffer.length) {
+        logger.warn(`Buffer too short for order ${i+1}`);
+        break;
+      }
+      
+      // Read according to the specification
+      const buyFlag = buffer.readInt16LE(pos);
+      const quantity = Number(buffer.readBigInt64LE(pos + 2));
+      const rawPrice = Number(buffer.readBigInt64LE(pos + 10));
+      const price = rawPrice / 100; // Price is divided by 100 as per docs
+      const orders = buffer.readInt16LE(pos + 18);
+      
+      // Skip entries with wrong buy/sell flag
+      if (buyFlag !== 1 && buyFlag !== 0) {
+        logger.warn(`Invalid buy/sell flag ${buyFlag} at position ${pos}`);
+        continue;
+      }
+      
+      // Add to the appropriate array based on the flag
+      if (buyFlag === 1) {
+        bestFive.buy.push({
+          quantity,
+          price: parseFloat(price.toFixed(2)),
+          orders
+        });
+      } else if (buyFlag === 0) {
+        bestFive.sell.push({
+          quantity,
+          price: parseFloat(price.toFixed(2)),
+          orders
+        });
+      }
+    }
+    
+    // Sort buy orders by price in descending order
+    bestFive.buy.sort((a, b) => b.price - a.price);
+    
+    // Sort sell orders by price in ascending order
+    bestFive.sell.sort((a, b) => a.price - b.price);
+    
+    // Truncate to 5 entries if we have more
+    if (bestFive.buy.length > 5) bestFive.buy = bestFive.buy.slice(0, 5);
+    if (bestFive.sell.length > 5) bestFive.sell = bestFive.sell.slice(0, 5);
+    
+    // Log the prices for debugging
+    logger.debug(`Buy prices (descending): ${bestFive.buy.map(b => b.price).join(', ')}`);
+    logger.debug(`Sell prices (ascending): ${bestFive.sell.map(s => s.price).join(', ')}`);
+    
+    return bestFive;
+  } catch (error) {
+    logger.error(`Error extracting Best Five Data: ${error.message}`);
+    logger.error(`Error stack: ${error.stack}`);
+    
+    // Return an empty structure on error to avoid crashing
+    return {
+      buy: [],
+      sell: []
+    };
+  }
+}
+
+/**
+ * Convert raw price to proper decimal value
+ * @param {number} rawPrice - Raw price value
+ * @param {number} exchangeType - Exchange type code
+ * @returns {number} Converted price value
+ */
+function convertPrice(rawPrice, exchangeType) {
+  try {
+    // For currencies (CDE_FO - 13), divide by 10000000.0
+    if (exchangeType === 13) {
+      return rawPrice / 10000000.0;
+    }
+    
+    // For everything else, divide by 100
+    return rawPrice / 100.0;
+  } catch (error) {
+    logger.error(`Error converting price: ${error.message}`);
+    return rawPrice; // Return raw price as fallback
+  }
+}
+
 
 /**
  * Update symbol price in Redis
@@ -2022,33 +3154,57 @@ function handleDataTicks(ticks) {
  */
 async function updateSymbolPrice(symbol, token, tickData) {
   try {
+    if (!symbol || !token) {
+      logger.warn(`Cannot update price: Missing symbol or token`);
+      return;
+    }
+    
     const priceKey = `price:${symbol}`;
     
-    // Create a simplified price object
+    // Create a simplified price object with default values to prevent undefined
     const priceData = {
       symbol,
       token,
-      lastPrice: tickData.ltp || 0,
-      open: tickData.open || 0,
-      high: tickData.high || 0,
-      low: tickData.low || 0,
-      close: tickData.close || 0,
-      totalBuyQty: tickData.totBuyQty || tickData.totalBuyQuantity || 0,
-      totalSellQty: tickData.totSellQty || tickData.totalSellQuantity || 0,
-      volume: tickData.totalTradedQty || tickData.volume || 0,
+      lastPrice: tickData?.ltp || 0,
+      open: tickData?.open || 0,
+      high: tickData?.high || 0,
+      low: tickData?.low || 0,
+      close: tickData?.close || 0,
+      totalBuyQty: tickData?.totBuyQty || tickData?.totalBuyQuantity || 0,
+      totalSellQty: tickData?.totSellQty || tickData?.totalSellQuantity || 0,
+      volume: tickData?.totalTradedQty || tickData?.volume || 0,
       lastUpdateTime: Date.now()
     };
     
-    // Store in Redis
-    await redisClient.set(priceKey, JSON.stringify(priceData));
+    // Log the price data for debugging
+    logger.debug(`Updating price for ${symbol}: ${JSON.stringify(priceData)}`);
     
-    // Publish update for any real-time subscribers
-    await redisPubSub.publish(`price:update:${symbol}`, JSON.stringify(priceData));
+    // Store in Redis (with try/catch)
+    try {
+      await redisClient.set(priceKey, JSON.stringify(priceData));
+      logger.debug(`Successfully updated price for ${symbol} in Redis`);
+    } catch (redisError) {
+      logger.error(`Redis error updating price for ${symbol}: ${redisError.message}`);
+      return; // Exit early if Redis store fails
+    }
+    
+    // Publish update for any real-time subscribers (with try/catch)
+    // Use redisPublisher instead of redisPubSub
+    try {
+      await redisPublisher.publish(`price:update:${symbol}`, JSON.stringify(priceData));
+      logger.debug(`Successfully published price update for ${symbol}`);
+    } catch (publishError) {
+      logger.error(`Redis publish error for ${symbol}: ${publishError.message}`);
+    }
     
   } catch (error) {
-    logger.error(`Error updating price for ${symbol}:`, error);
+    logger.error(`Error updating price for ${symbol}: ${error.message}`);
+    if (error.stack) {
+      logger.debug(`Stack trace: ${error.stack}`);
+    }
   }
 }
+
 
 /**
  * Update order plan price
@@ -2057,12 +3213,33 @@ async function updateSymbolPrice(symbol, token, tickData) {
  */
 async function updateOrderPlanPrice(planId, tickData) {
   try {
+    if (!planId) {
+      logger.warn(`Cannot update order plan: Missing planId`);
+      return;
+    }
+    
+    if (!tickData || typeof tickData.ltp !== 'number') {
+      logger.warn(`Cannot update order plan ${planId}: Invalid tick data`);
+      return;
+    }
+    
     // Get the order plan
-    const plan = await orderPlanRedisService.getOrderPlan(planId);
+    let plan;
+    try {
+      plan = await orderPlanRedisService.getOrderPlan(planId);
+    } catch (getPlanError) {
+      logger.error(`Error getting order plan ${planId}: ${getPlanError.message}`);
+      return;
+    }
     
     if (!plan) {
+      logger.warn(`Order plan ${planId} not found, removing from subscriptions`);
       // Plan doesn't exist anymore, remove from subscriptions
-      unsubscribeFromOrderPlan(planId);
+      try {
+        await unsubscribeFromOrderPlan(planId);
+      } catch (unsubError) {
+        logger.error(`Error unsubscribing deleted plan ${planId}: ${unsubError.message}`);
+      }
       return;
     }
     
@@ -2072,48 +3249,115 @@ async function updateOrderPlanPrice(planId, tickData) {
       lastUpdated: new Date().toISOString()
     };
     
-    // Calculate price difference from entry
-    if (plan.entry_price) {
-      const entryPrice = parseFloat(plan.entry_price);
-      const currentPrice = updates.currentPrice;
-      
-      updates.priceDiff = currentPrice - entryPrice;
-      updates.priceDiffPercentage = ((currentPrice - entryPrice) / entryPrice * 100).toFixed(2);
-      
-      // Check if price has reached entry or exit
-      if (plan.transactiontype === 'BUY') {
-        // For buy orders
-        if (currentPrice <= entryPrice && plan.status === 'CREATED') {
-          updates.status = 'ENTRY_TRIGGERED';
-        } else if (currentPrice >= parseFloat(plan.exit_price) && ['ENTRY_TRIGGERED', 'CREATED'].includes(plan.status)) {
-          updates.status = 'EXIT_TRIGGERED';
-        }
-      } else {
-        // For sell orders
-        if (currentPrice >= entryPrice && plan.status === 'CREATED') {
-          updates.status = 'ENTRY_TRIGGERED';
-        } else if (currentPrice <= parseFloat(plan.exit_price) && ['ENTRY_TRIGGERED', 'CREATED'].includes(plan.status)) {
-          updates.status = 'EXIT_TRIGGERED';
-        }
-      }
-    }
+    // Log updates for debugging
+    logger.debug(`Updating order plan ${planId} with: ${JSON.stringify(updates)}`);
     
     // Update the plan in Redis
-    await orderPlanRedisService.updateOrderPlan(planId, updates);
+    try {
+      await orderPlanRedisService.updateOrderPlan(planId, updates);
+      logger.info(`Order plan ${planId} updated successfully`);
+    } catch (updateError) {
+      logger.error(`Error updating order plan ${planId} in Redis: ${updateError.message}`);
+      return; // Exit early if update fails
+    }
     
-    // Publish an update event
-    await redisPubSub.publish(`orderplan:update:${planId}`, JSON.stringify({
-      planId,
-      updates
-    }));
+    // Publish an update event - use redisPublisher instead of redisPubSub
+    try {
+      await redisPublisher.publish(`orderplan:update:${planId}`, JSON.stringify({
+        planId,
+        updates
+      }));
+      logger.debug(`Successfully published update for order plan ${planId}`);
+    } catch (publishError) {
+      logger.error(`Error publishing update for plan ${planId}: ${publishError.message}`);
+    }
     
   } catch (error) {
-    logger.error(`Error updating order plan ${planId}:`, error);
+    logger.error(`Error updating order plan ${planId}: ${error.message}`);
+    if (error.stack) {
+      logger.debug(`Stack trace: ${error.stack}`);
+    }
+  }
+}
+/**
+ * Request market data for all subscribed tokens
+ */
+function requestMarketData() {
+  try {
+    if (connectionState !== ConnectionState.READY || !ws || ws.readyState !== WebSocket.OPEN) {
+      logger.warn(`Cannot request market data: WebSocket not ready (state: ${connectionState})`);
+      return;
+    }
+    
+    // Group tokens by exchange
+    const tokensByExchange = new Map(); // exchangeType -> array of tokens
+    
+    // Process all subscriptions
+    for (const [token, planIds] of subscriptions.entries()) {
+      if (planIds.size === 0) continue;
+      
+      // Get symbol for the token
+      const symbol = tokenToSymbolMap.get(token);
+      if (!symbol) {
+        logger.warn(`Cannot find symbol for token ${token}`);
+        continue;
+      }
+      
+      // Get exchange type for this symbol
+      const plan = findOrderPlanBySymbolSync(symbol);
+      if (!plan) {
+        logger.warn(`Cannot find order plan for symbol ${symbol}`);
+        continue;
+      }
+      
+      const exchangeType = mapExchangeToType(plan.exchange);
+      
+      // Add to tokens by exchange map
+      if (!tokensByExchange.has(exchangeType)) {
+        tokensByExchange.set(exchangeType, []);
+      }
+      
+      tokensByExchange.get(exchangeType).push(parseInt(token, 10));
+    }
+    
+    // If no tokens to request, return
+    if (tokensByExchange.size === 0) {
+      logger.debug('No tokens to request market data for');
+      return;
+    }
+    
+    // Build token list for request
+    const tokenList = [];
+    for (const [exchangeType, tokens] of tokensByExchange.entries()) {
+      tokenList.push({
+        exchangeType,
+        tokens
+      });
+    }
+    
+    // Create request message
+    const requestMessage = {
+      correlationID: "marketdata_" + Date.now(),
+      action: 2, // MARKET_DATA_REQUEST
+      params: {
+        mode: priceMode, // FULL mode
+        tokenList
+      }
+    };
+    console.log(requestMessage);
+    // Log request summary
+    const tokenCount = tokenList.reduce((sum, item) => sum + item.tokens.length, 0);
+    logger.info(`Requesting market data for ${tokenCount} tokens across ${tokenList.length} exchanges`);
+    
+    // Send request
+    ws.send(JSON.stringify(requestMessage));
+  } catch (error) {
+    logger.error('Error requesting market data:', error);
   }
 }
 
 /**
- * Subscribe to an order plan
+ * Subscribe to an order plan on both WebSockets
  * @param {string} planId - Order plan ID
  */
 export async function subscribeToOrderPlan(planId) {
@@ -2127,6 +3371,7 @@ export async function subscribeToOrderPlan(planId) {
     
     const token = plan.symboltoken;
     const symbol = plan.tradingsymbol;
+    const exchange = plan.exchange;
     
     // Add to maps
     tokenToSymbolMap.set(token, symbol);
@@ -2135,17 +3380,95 @@ export async function subscribeToOrderPlan(planId) {
     // Initialize subscription set if needed
     if (!subscriptions.has(token)) {
       subscriptions.set(token, new Set());
-      
-      // Subscribe to the new token
-      await subscribeToToken(token, plan.exchange);
     }
     
     // Add plan to subscription set
     subscriptions.get(token).add(planId);
     
-    logger.info(`Subscribed plan ${planId} to symbol ${symbol} (token ${token})`);
+    // Subscribe to both WebSockets if they're ready
+    if (ltpConnectionState === ConnectionState.READY && wsLTP && wsLTP.readyState === WebSocket.OPEN) {
+      subscribeLTP(token, exchange);
+    }
+    
+    if (depthConnectionState === ConnectionState.READY && wsMarketDepth && wsMarketDepth.readyState === WebSocket.OPEN) {
+      subscribeMarketDepth(token, exchange);
+    }
+    
+    logger.info(`Subscribed plan ${planId} to symbol ${symbol} on exchange ${exchange} (token ${token})`);
   } catch (error) {
     logger.error(`Error subscribing to order plan ${planId}:`, error);
+  }
+}
+
+/**
+ * Subscribe to LTP data for a token
+ * @param {string} token - Token to subscribe to
+ * @param {string} exchange - Exchange name
+ */
+function subscribeLTP(token, exchange) {
+  try {
+    const exchangeType = mapExchangeToType(exchange);
+    
+    // Create subscription message
+    const subscriptionMessage = {
+      correlationID: "ltp_subscription_" + Date.now(),
+      action: 1, // SUBSCRIBE
+      params: {
+        mode: 1, // LTP mode
+        tokenList: [
+          {
+            exchangeType,
+            tokens: [parseInt(token, 10)]
+          }
+        ]
+      }
+    };
+    
+    // Send subscription
+    if (wsLTP && wsLTP.readyState === WebSocket.OPEN) {
+      wsLTP.send(JSON.stringify(subscriptionMessage));
+      logger.info(`Subscribed to LTP data for token ${token} on exchange type ${exchangeType}`);
+    } else {
+      logger.error('LTP WebSocket not connected, cannot subscribe');
+    }
+  } catch (error) {
+    logger.error(`Error subscribing to LTP data for token ${token}:`, error);
+  }
+}
+
+/**
+ * Subscribe to Market Depth data for a token
+ * @param {string} token - Token to subscribe to
+ * @param {string} exchange - Exchange name
+ */
+function subscribeMarketDepth(token, exchange) {
+  try {
+    const exchangeType = mapExchangeToType(exchange);
+    
+    // Create subscription message
+    const subscriptionMessage = {
+      correlationID: "marketdepth_subscription_" + Date.now(),
+      action: 1, // SUBSCRIBE
+      params: {
+        mode: 3, // Snap Quote mode
+        tokenList: [
+          {
+            exchangeType,
+            tokens: [parseInt(token, 10)]
+          }
+        ]
+      }
+    };
+    
+    // Send subscription
+    if (wsMarketDepth && wsMarketDepth.readyState === WebSocket.OPEN) {
+      wsMarketDepth.send(JSON.stringify(subscriptionMessage));
+      logger.info(`Subscribed to Market Depth data for token ${token} on exchange type ${exchangeType}`);
+    } else {
+      logger.error('Market Depth WebSocket not connected, cannot subscribe');
+    }
+  } catch (error) {
+    logger.error(`Error subscribing to Market Depth data for token ${token}:`, error);
   }
 }
 
@@ -2182,46 +3505,6 @@ export async function unsubscribeFromOrderPlan(planId) {
 }
 
 /**
- * Subscribe to a token
- * @param {string} token - Symbol token
- * @param {string} exchange - Exchange (NSE, BSE, etc.)
- */
-async function subscribeToToken(token, exchange) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    logger.warn(`Cannot subscribe to token ${token}: WebSocket not connected`);
-    return;
-  }
-  
-  try {
-    // Map exchange to exchange type
-    const exchangeType = mapExchangeToType(exchange);
-    
-    // Create subscription message
-    const subscribeMessage = {
-      correlationID: "subscribe_" + Date.now(),
-      action: 1, // Subscribe
-      params: {
-        mode: 1, // FULL mode
-        tokenList: [
-          {
-            exchangeType,
-            tokens: [token]
-          }
-        ]
-      }
-    };
-    console.log(subscribeMessage);
-    // Send subscription request
-    ws.send(JSON.stringify(subscribeMessage));
-    
-    logger.info(`Subscribed to token ${token} on exchange ${exchange} (type ${exchangeType})`);
-  } catch (error) {
-    logger.error(`Error subscribing to token ${token}:`, error);
-    throw error;
-  }
-}
-
-/**
  * Unsubscribe from a token
  * @param {string} token - Symbol token
  */
@@ -2232,27 +3515,26 @@ async function unsubscribeFromToken(token) {
   }
   
   try {
-    // Find exchange type for this token
+    // Find symbol and exchange for the token
     const symbol = tokenToSymbolMap.get(token);
-    const plan = await findOrderPlanBySymbol(symbol);
-    
-    if (!plan) {
-      logger.warn(`Cannot determine exchange for token ${token}`);
+    if (!symbol) {
+      logger.warn(`Cannot find symbol for token ${token}`);
       return;
     }
     
-    const exchangeType = mapExchangeToType(plan.exchange);
+    // Get exchange type for this token
+    const exchangeType = await getExchangeTypeForSymbol(symbol);
     
     // Create unsubscribe message
     const unsubscribeMessage = {
       correlationID: "unsubscribe_" + Date.now(),
       action: 0, // Unsubscribe
       params: {
-        mode: 1, // FULL mode
+        mode: priceMode,
         tokenList: [
           {
             exchangeType,
-            tokens: [token]
+            tokens: [parseInt(token, 10)]
           }
         ]
       }
@@ -2268,18 +3550,143 @@ async function unsubscribeFromToken(token) {
 }
 
 /**
- * Find an order plan by symbol
+ * Get exchange type for a symbol
  * @param {string} symbol - Trading symbol
- * @returns {Promise<Object|null>} Order plan or null
+ * @returns {Promise<number>} Exchange type code
  */
-async function findOrderPlanBySymbol(symbol) {
+async function getExchangeTypeForSymbol(symbol) {
   try {
-    const plans = await orderPlanRedisService.getAllOrderPlans({ symbol }, 1, 0);
-    return plans.length > 0 ? plans[0] : null;
+    // Get plan from Redis
+    const plans = await orderPlanRedisService.getAllOrderPlans({ tradingsymbol: symbol }, 1, 0);
+    
+    if (plans.length > 0) {
+      return mapExchangeToType(plans[0].exchange);
+    }
+    
+    // Try to determine exchange from symbol name
+    if (symbol.includes('NIFTY') || symbol.includes('BANKNIFTY')) {
+      if (symbol.includes('FUT')) {
+        return 2; // NSE_FO (NFO)
+      } else if (symbol.includes('PE') || symbol.includes('CE')) {
+        return 2; // NSE_FO (NFO)
+      } else {
+        return 1; // NSE_CM
+      }
+    } else if (symbol.includes('SENSEX') || symbol.includes('BSE')) {
+      if (symbol.includes('FUT') || symbol.includes('PE') || symbol.includes('CE')) {
+        return 4; // BSE_FO
+      } else {
+        return 3; // BSE_CM
+      }
+    } else if (symbol.includes('USDINR') || symbol.includes('EURINR') || 
+               symbol.includes('GBPINR') || symbol.includes('JPYINR')) {
+      return 13; // CDE_FO (Currency Derivatives)
+    } else if (symbol.includes('GOLD') || symbol.includes('SILVER') || 
+               symbol.includes('CRUDE') || symbol.includes('COPPER') || 
+               symbol.includes('NATURAL')) {
+      return 5; // MCX_FO
+    } else if (symbol.includes('BARLEY') || symbol.includes('WHEAT') || 
+               symbol.includes('COTTON') || symbol.includes('SOYBEAN')) {
+      return 7; // NCX_FO (NCDEX)
+    }
+    
+    // Detect based on symbol format patterns
+    
+    // Options pattern: e.g., NIFTY28AUG2524000PE
+    if (/[A-Z]+\d{2}[A-Z]{3}\d{2}\d+(?:CE|PE)/.test(symbol)) {
+      return 2; // NSE_FO
+    }
+    
+    // Futures pattern: e.g., NIFTY28AUG25FUT
+    if (/[A-Z]+\d{2}[A-Z]{3}\d{2}FUT/.test(symbol)) {
+      return 2; // NSE_FO
+    }
+    
+    // BSE stocks usually have a suffix
+    if (symbol.endsWith('-BE') || symbol.endsWith('.BO')) {
+      return 3; // BSE_CM
+    }
+    
+    // Default to NSE_CM for regular stocks
+    return 1;
   } catch (error) {
-    logger.error(`Error finding order plan by symbol ${symbol}:`, error);
+    logger.error(`Error getting exchange type for ${symbol}:`, error);
+    return 1; // Default to NSE_CM
+  }
+}
+
+/**
+ * Find order plan by symbol from cache
+ * @param {string} symbol - Trading symbol
+ * @returns {Object|null} Order plan or null if not found
+ */
+function findOrderPlanBySymbolSync(symbol) {
+  try {
+    if (!symbol) return null;
+    
+    // Parse the symbol to detect exchange and token
+    const exchange = detectExchangeFromSymbol(symbol);
+    
+    // Return minimal info
+    return {
+      tradingsymbol: symbol,
+      exchange: exchange
+    };
+  } catch (error) {
+    logger.error(`Error finding order plan for symbol ${symbol}:`, error);
     return null;
   }
+}
+
+/**
+ * Detect exchange from symbol name
+ * @param {string} symbol - Trading symbol
+ * @returns {string} Exchange name
+ */
+function detectExchangeFromSymbol(symbol) {
+  // Futures and options on NSE
+  if ((symbol.includes('NIFTY') || symbol.includes('BANKNIFTY')) && 
+      (symbol.includes('FUT') || symbol.includes('PE') || symbol.includes('CE'))) {
+    return 'NFO';
+  }
+  
+  // Other NSE futures and options
+  if (/[A-Z]+\d{2}[A-Z]{3}\d{2}\d+(?:CE|PE)/.test(symbol) || 
+      /[A-Z]+\d{2}[A-Z]{3}\d{2}FUT/.test(symbol)) {
+    return 'NFO';
+  }
+  
+  // BSE stocks and derivatives
+  if (symbol.endsWith('-BE') || symbol.endsWith('.BO') || 
+      symbol.includes('SENSEX')) {
+    if (symbol.includes('FUT') || symbol.includes('PE') || symbol.includes('CE')) {
+      return 'BSE_FO';
+    } else {
+      return 'BSE';
+    }
+  }
+  
+  // Currency symbols
+  if (symbol.includes('USDINR') || symbol.includes('EURINR') || 
+      symbol.includes('GBPINR') || symbol.includes('JPYINR') ||
+      (symbol.length === 6 && /[A-Z]{3}[A-Z]{3}/.test(symbol))) {
+    return 'CDS';
+  }
+  
+  // Commodity symbols on MCX
+  if (symbol.includes('MCX') || symbol.includes('GOLD') || symbol.includes('SILVER') || 
+      symbol.includes('CRUDE') || symbol.includes('COPPER') || symbol.includes('NATURAL')) {
+    return 'MCX';
+  }
+  
+  // Commodity symbols on NCDEX
+  if (symbol.includes('NCDEX') || symbol.includes('BARLEY') || symbol.includes('WHEAT') || 
+      symbol.includes('COTTON') || symbol.includes('SOYBEAN')) {
+    return 'NCDEX';
+  }
+  
+  // Default to NSE for stocks
+  return 'NSE';
 }
 
 /**
@@ -2288,90 +3695,104 @@ async function findOrderPlanBySymbol(symbol) {
  * @returns {number} Exchange type code
  */
 function mapExchangeToType(exchange) {
-  switch (exchange.toUpperCase()) {
-    case 'NSE':
-      return 1;
-    case 'BSE':
-      return 2;
-    case 'NFO':
-    case 'NSE_FO':
-      return 3;
-    case 'BFO':
-    case 'BSE_FO':
-      return 4;
-    case 'CDS':
-    case 'NSE_CDS':
-      return 5;
-    case 'MCX':
-      return 6;
-    case 'NCDEX':
-      return 7;
-    case 'BCD':
-    case 'BSE_CDS':
-      return 8;
-    default:
-      logger.warn(`Unknown exchange: ${exchange}, defaulting to NSE (1)`);
-      return 1;
+  try {
+    if (!exchange) return 1; // Default to NSE_CM
+    
+    if (typeof exchange === 'number') {
+      return exchange; // Already a type code
+    }
+    
+    const exchangeStr = String(exchange).toUpperCase();
+    
+    switch (exchangeStr) {
+      case 'NSE':
+      case 'NSE_CM':
+      case 'NSE_CAPITAL':
+        return 1; // NSE Capital Market
+        
+      case 'NFO':
+      case 'NSE_FO':
+      case 'NSE_FUTURES':
+      case 'NSE_OPTIONS':
+        return 2; // NSE Futures & Options
+        
+      case 'BSE':
+      case 'BSE_CM':
+      case 'BSE_CAPITAL':
+        return 3; // BSE Capital Market
+        
+      case 'BFO':
+      case 'BSE_FO':
+      case 'BSE_FUTURES':
+      case 'BSE_OPTIONS':
+        return 4; // BSE Futures & Options
+        
+      case 'MCX':
+      case 'MCX_FO':
+      case 'MCX_FUTURES':
+        return 5; // MCX Futures & Options
+        
+      case 'NCDEX':
+      case 'NCX_FO':
+      case 'NCDEX_FUTURES':
+        return 7; // NCDEX Futures
+        
+      case 'CDS':
+      case 'NSE_CDS':
+      case 'CURRENCY':
+      case 'CDE_FO':
+        return 13; // Currency Derivatives
+        
+      default:
+        logger.warn(`Unknown exchange: ${exchange}, defaulting to NSE_CM (1)`);
+        return 1; // Default to NSE Capital Market
+    }
+  } catch (error) {
+    logger.error(`Error mapping exchange to type: ${error.message}`);
+    return 1; // Default to NSE_CM in case of error
   }
 }
 
-
 /**
- * Resubscribe to all tokens
- * @param {Object} session - Session details
+ * Resubscribe to all active subscriptions
  */
-async function resubscribeAll(session) {
+async function resubscribeAll() {
   try {
-    // Group tokens by exchange
-    const exchangeTokens = new Map(); // Map<exchangeType, string[]>
+    logger.info('Resubscribing to all active subscriptions');
     
-    for (const [token, planIds] of subscriptions.entries()) {
-      if (planIds.size === 0) continue;
-      
-      const symbol = tokenToSymbolMap.get(token);
-      const plan = await findOrderPlanBySymbol(symbol);
-      
-      if (!plan) continue;
-      
-      const exchangeType = mapExchangeToType(plan.exchange);
-      
-      if (!exchangeTokens.has(exchangeType)) {
-        exchangeTokens.set(exchangeType, []);
-      }
-      
-      exchangeTokens.get(exchangeType).push(token);
-    }
-    
-    // Create token list for subscription
-    const tokenList = [];
-    for (const [exchangeType, tokens] of exchangeTokens.entries()) {
-      tokenList.push({
-        exchangeType,
-        tokens
-      });
-    }
-    
-    if (tokenList.length === 0) {
-      logger.info('No tokens to resubscribe');
+    // If no subscriptions, return
+    if (subscriptions.size === 0) {
+      logger.info('No subscriptions to resubscribe to');
       return;
     }
     
-    // Create subscription message
-    const subscribeMessage = {
-      correlationID: "resubscribe_" + Date.now(),
-      action: 1, // Subscribe
-      params: {
-        mode: 1, // FULL mode
-        tokenList
+    // Add all subscriptions to pending list
+    for (const [token, planIds] of subscriptions.entries()) {
+      // Skip if no plan IDs
+      if (planIds.size === 0) continue;
+      
+      // Get symbol for the token
+      const symbol = tokenToSymbolMap.get(token);
+      if (!symbol) {
+        logger.warn(`Cannot find symbol for token ${token}`);
+        continue;
       }
-    };
-    console.log(subscribeMessage);
-    // Send subscription request
-    ws.send(JSON.stringify(subscribeMessage));
+      
+      // Get exchange for the symbol
+      const exchange = detectExchangeFromSymbol(symbol);
+      
+      // Add to pending subscriptions
+      pendingSubscriptions.set(token, {
+        symbol,
+        exchange,
+        planId: planIds.values().next().value // Use first plan ID
+      });
+    }
     
-    logger.info(`Resubscribed to ${tokenList.length} exchanges with ${subscriptions.size} tokens`);
+    // Process pending subscriptions
+    processPendingSubscriptions();
   } catch (error) {
-    logger.error('Error resubscribing to tokens:', error);
+    logger.error('Error resubscribing to all active subscriptions:', error);
   }
 }
 
@@ -2404,10 +3825,15 @@ async function refreshSubscriptions() {
     // Re-authenticate
     const session = await authenticate();
     
-    // Reconnect WebSocket with new session
-    connectWebSocket(session);
+   // Reconnect both WebSockets with new session
+    await Promise.all([
+      connectLTPWebSocket(session),
+      connectMarketDepthWebSocket(session)
+    ]);
+    
+    logger.info('WebSocket connections refreshed successfully');
   } catch (error) {
-    logger.error('Error refreshing subscriptions:', error);
+    logger.error('Error refreshing WebSocket subscriptions:', error);
   }
 }
 
@@ -2447,6 +3873,30 @@ export async function getLastTick(symbol) {
   }
 }
 
+
+/**
+ * Get exchange name from exchange type code
+ * @param {number} exchangeType - Exchange type code
+ * @returns {string} Exchange name
+ */
+function getExchangeName(exchangeType) {
+  try {
+    switch (exchangeType) {
+      case 1: return 'NSE_CM';
+      case 2: return 'NSE_FO';
+      case 3: return 'BSE_CM';
+      case 4: return 'BSE_FO';
+      case 5: return 'MCX_FO';
+      case 7: return 'NCX_FO';
+      case 13: return 'CDE_FO';
+      default: return `UNKNOWN(${exchangeType})`;
+    }
+  } catch (error) {
+    logger.error(`Error getting exchange name: ${error.message}`);
+    return `UNKNOWN(${exchangeType})`;
+  }
+}
+
 /**
  * Get all current subscriptions
  * @returns {Object} Current subscription data
@@ -2472,7 +3922,7 @@ export function getCurrentSubscriptions() {
   return result;
 }
 
-// Export modified orderPlanRedisService with WebSocket integration
+// Export orderPlanService with WebSocket integration
 export const orderPlanService = {
   // Create order plan with WebSocket subscription
   async storeOrderPlan(orderPlan) {
@@ -2480,8 +3930,8 @@ export const orderPlanService = {
       // Store in Redis
       const storedPlan = await orderPlanRedisService.storeOrderPlan(orderPlan);
       
-      // Publish event for WebSocket subscription
-      await redisPubSub.publish('orderplan:new', storedPlan.id);
+      // Publish event for WebSocket subscription - use redisPublisher
+      await redisPublisher.publish('orderplan:new', storedPlan.id);
       
       return storedPlan;
     } catch (error) {
@@ -2497,8 +3947,8 @@ export const orderPlanService = {
       const deleted = await orderPlanRedisService.deleteOrderPlan(planId);
       
       if (deleted) {
-        // Publish event for WebSocket unsubscription
-        await redisPubSub.publish('orderplan:delete', planId);
+        // Publish event for WebSocket unsubscription - use redisPublisher
+        await redisPublisher.publish('orderplan:delete', planId);
       }
       
       return deleted;
